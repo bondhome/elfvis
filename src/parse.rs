@@ -237,7 +237,7 @@ pub fn parse_elf(data: &[u8]) -> Result<Vec<ResolvedSymbol>, String> {
                 .binary_search_by_key(&sym.address, |&(low, _, _)| low)
                 .map_or_else(
                     |i| i.checked_sub(1),
-                    |i| Some(i),
+                    Some,
                 )
                 .and_then(|i| {
                     let (low, high, ref path) = addr_to_path[i];
@@ -260,7 +260,7 @@ pub fn parse_elf(data: &[u8]) -> Result<Vec<ResolvedSymbol>, String> {
 
 /// Strip the longest common directory prefix from all paths in the address map.
 /// Only strips at directory boundaries (i.e. at '/' characters).
-fn strip_common_prefix(entries: &mut Vec<(u64, u64, String)>) {
+fn strip_common_prefix(entries: &mut [(u64, u64, String)]) {
     if entries.is_empty() {
         return;
     }
