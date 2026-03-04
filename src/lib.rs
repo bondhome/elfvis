@@ -18,6 +18,7 @@ struct AppState {
     total_size: u64,
     canvas_width: f64,
     canvas_height: f64,
+    dpr: f64,
 }
 
 thread_local! {
@@ -27,6 +28,7 @@ thread_local! {
         total_size: 0,
         canvas_width: 0.0,
         canvas_height: 0.0,
+        dpr: 1.0,
     });
 }
 
@@ -168,6 +170,7 @@ fn process_elf(filename: &str, data: &[u8]) {
             let w = win.inner_width().unwrap().as_f64().unwrap();
             let h = win.inner_height().unwrap().as_f64().unwrap() - 36.0;
 
+            let dpr = win.device_pixel_ratio();
             let layout_root = layout::layout(&size_tree, w, h);
 
             STATE.with(|s| {
@@ -177,6 +180,7 @@ fn process_elf(filename: &str, data: &[u8]) {
                 state.total_size = total_size;
                 state.canvas_width = w;
                 state.canvas_height = h;
+                state.dpr = dpr;
             });
 
             show_header(&document, filename, total_size);
@@ -184,10 +188,16 @@ fn process_elf(filename: &str, data: &[u8]) {
                 .unchecked_ref::<HtmlElement>().class_list().add_1("hidden").ok();
 
             let canvas: HtmlCanvasElement = document.get_element_by_id("canvas").unwrap().unchecked_into();
-            canvas.set_width(w as u32);
-            canvas.set_height(h as u32);
+            // Set backing store to physical pixels for crisp rendering
+            canvas.set_width((w * dpr) as u32);
+            canvas.set_height((h * dpr) as u32);
+            // Set CSS display size to logical pixels
+            canvas.style().set_property("width", &format!("{w}px")).ok();
+            canvas.style().set_property("height", &format!("{h}px")).ok();
             let ctx = canvas.get_context("2d").unwrap().unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
+            // Scale context so draw calls use CSS pixel coordinates
+            ctx.scale(dpr, dpr).ok();
             STATE.with(|s| {
                 let state = s.borrow();
                 if let Some(ref root) = state.layout_root {
@@ -240,6 +250,8 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
                 let ctx = canvas.get_context("2d").unwrap().unwrap()
                     .unchecked_into::<CanvasRenderingContext2d>();
 
+                // Reset transform and re-apply DPR scaling
+                ctx.set_transform(state.dpr, 0.0, 0.0, state.dpr, 0.0, 0.0).ok();
                 render::render(&ctx, root);
 
                 if let Some(path) = layout::hit_test(root, x, y) {
