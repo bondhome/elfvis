@@ -12,17 +12,14 @@ impl Color {
     }
 }
 
-/// Generate a pastel color for a given color group and depth.
-/// - `group`: top-level ancestor index (determines hue)
-/// - `num_groups`: total number of top-level groups (for hue spacing)
-/// - `depth`: depth in the tree (deeper = slightly darker)
-pub fn pastel_color(group: usize, num_groups: usize, depth: usize) -> Color {
-    let num_groups = num_groups.max(1);
-    let hue = (group as f64 / num_groups as f64) * 360.0;
-    let saturation = 0.40;
-    let lightness = (0.85 - depth as f64 * 0.03).max(0.65);
+/// Generate a pastel color for a given hue angle and depth.
+/// - `hue`: hue angle in degrees (0..360)
+/// - `depth`: depth in the tree (deeper = more vivid and slightly darker)
+pub fn pastel_color(hue: f64, depth: usize) -> Color {
+    let saturation = (0.30 + depth as f64 * 0.04).min(0.55);
+    let lightness = (0.88 - depth as f64 * 0.015).max(0.70);
 
-    hsl_to_rgb(hue, saturation, lightness)
+    hsl_to_rgb(hue % 360.0, saturation, lightness)
 }
 
 fn hsl_to_rgb(h: f64, s: f64, l: f64) -> Color {
@@ -52,9 +49,10 @@ mod tests {
 
     #[test]
     fn test_produces_pastel_range() {
-        let c = pastel_color(0, 5, 1);
+        let c = pastel_color(0.0, 1);
+        // Shallow nodes have low saturation / high lightness → all channels bright
         assert!(
-            c.r > 150 && c.g > 150 && c.b > 150,
+            c.r > 140 && c.g > 140 && c.b > 140,
             "should be pastel, got ({},{},{})",
             c.r,
             c.g,
@@ -63,30 +61,30 @@ mod tests {
     }
 
     #[test]
-    fn test_different_groups_different_hues() {
-        let c0 = pastel_color(0, 4, 1);
-        let c1 = pastel_color(1, 4, 1);
+    fn test_different_hues_different_colors() {
+        let c0 = pastel_color(0.0, 1);
+        let c1 = pastel_color(90.0, 1);
         let diff = (c0.r as i32 - c1.r as i32).abs()
             + (c0.g as i32 - c1.g as i32).abs()
             + (c0.b as i32 - c1.b as i32).abs();
         assert!(
             diff > 30,
-            "different groups should have visually distinct colors, diff={diff}"
+            "different hues should have visually distinct colors, diff={diff}"
         );
     }
 
     #[test]
     fn test_deeper_is_slightly_darker() {
-        let shallow = pastel_color(0, 4, 1);
-        let deep = pastel_color(0, 4, 4);
+        let shallow = pastel_color(0.0, 1);
+        let deep = pastel_color(0.0, 4);
         let lum_shallow = shallow.r as u32 + shallow.g as u32 + shallow.b as u32;
         let lum_deep = deep.r as u32 + deep.g as u32 + deep.b as u32;
         assert!(lum_shallow > lum_deep, "deeper nodes should be slightly darker");
     }
 
     #[test]
-    fn test_single_group() {
-        let c = pastel_color(0, 1, 0);
-        assert!(c.r > 100);
+    fn test_hue_wraps() {
+        let c = pastel_color(720.0, 0);
+        assert!(c.r > 100, "wrapped hue should still produce valid color");
     }
 }

@@ -14,7 +14,6 @@ use std::cell::RefCell;
 
 struct AppState {
     layout_root: Option<layout::LayoutNode>,
-    num_color_groups: usize,
     filename: String,
     total_size: u64,
     canvas_width: f64,
@@ -24,7 +23,6 @@ struct AppState {
 thread_local! {
     static STATE: RefCell<AppState> = RefCell::new(AppState {
         layout_root: None,
-        num_color_groups: 0,
         filename: String::new(),
         total_size: 0,
         canvas_width: 0.0,
@@ -36,6 +34,15 @@ thread_local! {
 pub fn main() -> Result<(), JsValue> {
     let win = window().unwrap();
     let document = win.document().unwrap();
+
+    // Populate build info on landing page
+    if let Some(el) = document.get_element_by_id("build-info") {
+        let version = env!("CARGO_PKG_VERSION");
+        let build_time = env!("ELFVIS_BUILD_TIME");
+        el.set_inner_html(&format!(
+            "v{version} &middot; built {build_time} &middot; <a href=\"https://github.com/bondhome/elfvis\" style=\"color:#ccc\">github</a>"
+        ));
+    }
 
     setup_drop_zone(&document)?;
     setup_file_input(&document)?;
@@ -157,8 +164,6 @@ fn process_elf(filename: &str, data: &[u8]) {
         Ok(symbols) => {
             let size_tree = tree::build_tree(&symbols);
             let total_size = size_tree.size;
-            let num_groups = size_tree.children.len();
-
             let win = window().unwrap();
             let w = win.inner_width().unwrap().as_f64().unwrap();
             let h = win.inner_height().unwrap().as_f64().unwrap() - 36.0;
@@ -168,7 +173,6 @@ fn process_elf(filename: &str, data: &[u8]) {
             STATE.with(|s| {
                 let mut state = s.borrow_mut();
                 state.layout_root = Some(layout_root);
-                state.num_color_groups = num_groups;
                 state.filename = filename.to_string();
                 state.total_size = total_size;
                 state.canvas_width = w;
@@ -187,7 +191,7 @@ fn process_elf(filename: &str, data: &[u8]) {
             STATE.with(|s| {
                 let state = s.borrow();
                 if let Some(ref root) = state.layout_root {
-                    render::render(&ctx, root, state.num_color_groups);
+                    render::render(&ctx, root);
                 }
             });
         }
@@ -236,7 +240,7 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
                 let ctx = canvas.get_context("2d").unwrap().unwrap()
                     .unchecked_into::<CanvasRenderingContext2d>();
 
-                render::render(&ctx, root, state.num_color_groups);
+                render::render(&ctx, root);
 
                 if let Some(path) = layout::hit_test(root, x, y) {
                     let mut node = root;
@@ -248,14 +252,26 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
                         }
                     }
 
-                    let display_path = path[1..].join("/");
                     let pct = if state.total_size > 0 {
                         node.size as f64 / state.total_size as f64 * 100.0
                     } else {
                         0.0
                     };
                     let size_str = format_size(node.size);
-                    let tooltip = format!("{display_path}\n{size_str} ({pct:.1}%)");
+
+                    // Show "filename\nsymbol  size (pct%)"
+                    // The path is [root, ..dirs.., file, symbol] for leaves
+                    let parts = &path[1..];
+                    let tooltip = if parts.len() >= 2 {
+                        let file_node = &parts[parts.len() - 2];
+                        // basename: last component after any '/' from collapsed paths
+                        let basename = file_node.rsplit('/').next().unwrap_or(file_node);
+                        let sym_name = &parts[parts.len() - 1];
+                        format!("{basename}\n{sym_name}\n{size_str} ({pct:.1}%)")
+                    } else {
+                        let display_path = parts.join("/");
+                        format!("{display_path}\n{size_str} ({pct:.1}%)")
+                    };
 
                     render::render_tooltip(&ctx, x, y, &tooltip, state.canvas_width, state.canvas_height);
                 }

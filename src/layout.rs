@@ -17,7 +17,7 @@ pub struct LayoutNode {
     pub size: u64,
     pub depth: usize,
     pub is_leaf: bool,
-    pub color_group: usize,
+    pub hue: f64,
     pub children: Vec<LayoutNode>,
 }
 
@@ -28,11 +28,12 @@ pub const PADDING: f64 = 1.0;
 /// Lay out a `SizeNode` tree as a squarified treemap within the given canvas dimensions.
 pub fn layout(tree: &SizeNode, width: f64, height: f64) -> LayoutNode {
     let rect = Rect { x: 0.0, y: 0.0, w: width, h: height };
-    layout_node(tree, &rect, 0, 0)
+    layout_node(tree, &rect, 0, 0.0, 360.0)
 }
 
-fn layout_node(node: &SizeNode, rect: &Rect, depth: usize, color_group: usize) -> LayoutNode {
+fn layout_node(node: &SizeNode, rect: &Rect, depth: usize, hue_start: f64, hue_end: f64) -> LayoutNode {
     let is_leaf = node.children.is_empty();
+    let hue = (hue_start + hue_end) / 2.0;
 
     let children = if is_leaf || node.size == 0 {
         Vec::new()
@@ -50,13 +51,23 @@ fn layout_node(node: &SizeNode, rect: &Rect, depth: usize, color_group: usize) -
         let sizes: Vec<f64> = node.children.iter().map(|c| c.size as f64).collect();
         let rects = squarify(&sizes, &inner);
 
+        // Subdivide this node's hue interval among children proportional to size.
+        let total: f64 = sizes.iter().sum();
+        let mut cursor = hue_start;
+
         node.children
             .iter()
             .zip(rects.iter())
-            .enumerate()
-            .map(|(i, (child, r))| {
-                let cg = if depth == 0 { i } else { color_group };
-                layout_node(child, r, depth + 1, cg)
+            .zip(sizes.iter())
+            .map(|((child, r), &child_size)| {
+                let span = if total > 0.0 {
+                    (child_size / total) * (hue_end - hue_start)
+                } else {
+                    0.0
+                };
+                let child_hue_start = cursor;
+                cursor += span;
+                layout_node(child, r, depth + 1, child_hue_start, cursor)
             })
             .collect()
     };
@@ -67,7 +78,7 @@ fn layout_node(node: &SizeNode, rect: &Rect, depth: usize, color_group: usize) -
         size: node.size,
         depth,
         is_leaf,
-        color_group,
+        hue,
         children,
     }
 }
@@ -281,11 +292,26 @@ mod tests {
     }
 
     #[test]
-    fn test_color_groups_assigned() {
+    fn test_hue_proportional_to_size() {
         let root = layout(&sample_tree(), 800.0, 600.0);
-        assert_eq!(root.children[0].color_group, 0);
-        assert_eq!(root.children[1].color_group, 1);
-        assert_eq!(root.children[0].children[0].color_group, 0);
+        // "big" is 700/1000 = 70% → interval 0..252, midpoint 126
+        // "small" is 300/1000 = 30% → interval 252..360, midpoint 306
+        let big_hue = root.children[0].hue;
+        let small_hue = root.children[1].hue;
+        assert!((big_hue - 126.0).abs() < 0.01, "big midpoint should be ~126, got {big_hue}");
+        assert!((small_hue - 306.0).abs() < 0.01, "small midpoint should be ~306, got {small_hue}");
+    }
+
+    #[test]
+    fn test_hue_subdivides_recursively() {
+        let root = layout(&sample_tree(), 800.0, 600.0);
+        // "big" interval is 0..252
+        // Its children: a.c=400 (4/7 of 252=144 → 0..144, mid 72)
+        //               b.c=300 (3/7 of 252=108 → 144..252, mid 198)
+        let a_hue = root.children[0].children[0].hue;
+        let b_hue = root.children[0].children[1].hue;
+        assert!((a_hue - 72.0).abs() < 0.1, "a.c midpoint should be ~72, got {a_hue}");
+        assert!((b_hue - 198.0).abs() < 0.1, "b.c midpoint should be ~198, got {b_hue}");
     }
 
     #[test]

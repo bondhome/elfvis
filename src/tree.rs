@@ -57,7 +57,30 @@ pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
 
     // Compute sizes bottom-up and sort children by size descending
     compute_sizes(&mut root);
+    for child in &mut root.children {
+        collapse_single_children(child);
+    }
     root
+}
+
+/// Collapse single-child directory chains.
+/// When a directory has exactly one child that is also a directory,
+/// merge them: `parent/child` absorbs grandchildren. Repeat until stable.
+fn collapse_single_children(node: &mut SizeNode) {
+    // First recurse into children
+    for child in &mut node.children {
+        collapse_single_children(child);
+    }
+    // Then collapse: while this node has exactly one child that is a directory
+    while node.children.len() == 1 && !node.children[0].children.is_empty() {
+        let only_child = node.children.remove(0);
+        if node.name.is_empty() {
+            node.name = only_child.name;
+        } else {
+            node.name = format!("{}/{}", node.name, only_child.name);
+        }
+        node.children = only_child.children;
+    }
 }
 
 fn compute_sizes(node: &mut SizeNode) {
@@ -122,8 +145,12 @@ mod tests {
     fn test_file_contains_symbols() {
         let tree = build_tree(&make_symbols());
         let src = tree.children.iter().find(|c| c.name == "src").unwrap();
-        let app = src.children.iter().find(|c| c.name == "app").unwrap();
-        let main_c = app.children.iter().find(|c| c.name == "main.c").unwrap();
+        // app/main.c collapsed (app had single child main.c)
+        let main_c = src
+            .children
+            .iter()
+            .find(|c| c.name == "app/main.c")
+            .unwrap();
         assert_eq!(main_c.size, 300);
         assert_eq!(main_c.children.len(), 2);
         let sym_names: Vec<&str> = main_c.children.iter().map(|c| c.name.as_str()).collect();
@@ -150,5 +177,43 @@ mod tests {
         let tree = build_tree(&[]);
         assert_eq!(tree.size, 0);
         assert!(tree.children.is_empty());
+    }
+
+    #[test]
+    fn test_collapse_single_child_chain() {
+        // a/b/c/file.c where a→b→c are single-child dirs
+        let syms = vec![ResolvedSymbol {
+            name: "func".into(),
+            size: 42,
+            source_path: Some("a/b/c/file.c".into()),
+        }];
+        let tree = build_tree(&syms);
+        // Root should collapse a/b/c into one node
+        assert_eq!(tree.children.len(), 1);
+        let collapsed = &tree.children[0];
+        assert_eq!(collapsed.name, "a/b/c/file.c");
+        assert_eq!(collapsed.children.len(), 1);
+        assert_eq!(collapsed.children[0].name, "func");
+    }
+
+    #[test]
+    fn test_no_collapse_when_multiple_children() {
+        // Two files in same dir → should NOT collapse
+        let syms = vec![
+            ResolvedSymbol {
+                name: "f1".into(),
+                size: 10,
+                source_path: Some("dir/a.c".into()),
+            },
+            ResolvedSymbol {
+                name: "f2".into(),
+                size: 20,
+                source_path: Some("dir/b.c".into()),
+            },
+        ];
+        let tree = build_tree(&syms);
+        let dir = &tree.children[0];
+        assert_eq!(dir.name, "dir");
+        assert_eq!(dir.children.len(), 2);
     }
 }

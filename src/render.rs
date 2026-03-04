@@ -3,19 +3,19 @@ use web_sys::CanvasRenderingContext2d;
 use crate::color::pastel_color;
 use crate::layout::{LayoutNode, HEADER_HEIGHT, MIN_HEADER_HEIGHT};
 
-pub fn render(ctx: &CanvasRenderingContext2d, root: &LayoutNode, num_groups: usize) {
+pub fn render(ctx: &CanvasRenderingContext2d, root: &LayoutNode) {
     ctx.set_fill_style_str("#ffffff");
     ctx.fill_rect(root.rect.x, root.rect.y, root.rect.w, root.rect.h);
-    render_node(ctx, root, num_groups);
+    render_node(ctx, root);
 }
 
-fn render_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, num_groups: usize) {
+fn render_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode) {
     if node.rect.w < 1.0 || node.rect.h < 1.0 {
         return;
     }
 
     if node.is_leaf {
-        let c = pastel_color(node.color_group, num_groups, node.depth);
+        let c = pastel_color(node.hue, node.depth);
         ctx.set_fill_style_str(&c.to_css());
         ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
 
@@ -27,7 +27,7 @@ fn render_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, num_groups: us
     } else {
         let show_header = node.rect.h >= MIN_HEADER_HEIGHT && node.depth > 0;
         if show_header {
-            let c = pastel_color(node.color_group, num_groups, node.depth);
+            let c = pastel_color(node.hue, node.depth);
             let header_color = darken(&c, 0.15);
             ctx.set_fill_style_str(&header_color.to_css());
             ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, HEADER_HEIGHT);
@@ -44,7 +44,7 @@ fn render_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, num_groups: us
         }
 
         for child in &node.children {
-            render_node(ctx, child, num_groups);
+            render_node(ctx, child);
         }
 
         if node.depth > 0 {

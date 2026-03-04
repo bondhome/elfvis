@@ -139,7 +139,13 @@ pub fn parse_elf(data: &[u8]) -> Result<Vec<ResolvedSymbol>, String> {
                         addr_to_path.push((prev_addr, addr, prev_path.clone()));
                     }
                 }
-                prev_row = Some((row.address(), file_path));
+
+                if row.end_sequence() {
+                    // End-of-sequence: close range, don't carry forward
+                    prev_row = None;
+                } else {
+                    prev_row = Some((row.address(), file_path));
+                }
             }
         }
     }
@@ -149,10 +155,21 @@ pub fn parse_elf(data: &[u8]) -> Result<Vec<ResolvedSymbol>, String> {
     let resolved: Vec<ResolvedSymbol> = flash_symbols
         .into_iter()
         .map(|sym| {
+            // Binary search: find the last range whose low <= sym.address
             let source_path = addr_to_path
-                .iter()
-                .find(|(low, high, _)| sym.address >= *low && sym.address < *high)
-                .map(|(_, _, path)| path.clone());
+                .binary_search_by_key(&sym.address, |&(low, _, _)| low)
+                .map_or_else(
+                    |i| i.checked_sub(1),
+                    |i| Some(i),
+                )
+                .and_then(|i| {
+                    let (low, high, ref path) = addr_to_path[i];
+                    if sym.address >= low && sym.address < high {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                });
             ResolvedSymbol {
                 name: sym.name,
                 size: sym.size,
