@@ -55,6 +55,11 @@ pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
         });
     }
 
+    // Cluster unknown symbols by prefix
+    if let Some(unknown) = root.children.iter_mut().find(|c| c.name == "<unknown>") {
+        cluster_unknown_children(unknown);
+    }
+
     // Compute sizes bottom-up and sort children by size descending
     compute_sizes(&mut root);
     for child in &mut root.children {
@@ -92,6 +97,42 @@ fn compute_sizes(node: &mut SizeNode) {
     }
     node.size = node.children.iter().map(|c| c.size).sum();
     node.children.sort_by(|a, b| b.size.cmp(&a.size));
+}
+
+/// Regroup flat children of the `<unknown>` node into prefix-based clusters.
+/// Prefixes with fewer than 2 symbols are merged into an `<other>` catch-all.
+fn cluster_unknown_children(node: &mut SizeNode) {
+    use std::collections::HashMap;
+
+    // Bucket children by prefix
+    let mut buckets: HashMap<String, Vec<SizeNode>> = HashMap::new();
+    for child in node.children.drain(..) {
+        let prefix = extract_prefix(&child.name);
+        buckets.entry(prefix).or_default().push(child);
+    }
+
+    // Build cluster nodes; singletons go to <other>
+    let mut other_children: Vec<SizeNode> = Vec::new();
+    for (prefix, children) in buckets {
+        if children.len() >= 2 {
+            node.children.push(SizeNode {
+                name: prefix,
+                size: 0,
+                children,
+            });
+        } else {
+            other_children.extend(children);
+        }
+    }
+
+    // Add <other> if non-empty
+    if !other_children.is_empty() {
+        node.children.push(SizeNode {
+            name: "<other>".to_string(),
+            size: 0,
+            children: other_children,
+        });
+    }
 }
 
 /// Extract a cluster prefix from a symbol name.
@@ -264,6 +305,34 @@ mod tests {
         let dir = &tree.children[0];
         assert_eq!(dir.name, "dir");
         assert_eq!(dir.children.len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_unknown_groups_by_prefix() {
+        let syms = vec![
+            ResolvedSymbol { name: "mgfx_font_a".into(), size: 100, source_path: None },
+            ResolvedSymbol { name: "mgfx_font_b".into(), size: 200, source_path: None },
+            ResolvedSymbol { name: "__aeabi_dmul".into(), size: 50, source_path: None },
+            ResolvedSymbol { name: "__aeabi_ddiv".into(), size: 60, source_path: None },
+        ];
+        let tree = build_tree(&syms);
+        let unknown = tree.children.iter().find(|c| c.name == "<unknown>").unwrap();
+
+        // Should have 2 cluster nodes: "mgfx" and "__"
+        let names: Vec<&str> = unknown.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(unknown.children.len(), 2);
+        assert!(names.contains(&"mgfx"), "expected mgfx cluster: {names:?}");
+        assert!(names.contains(&"__"), "expected __ cluster: {names:?}");
+
+        // mgfx cluster should contain the 2 mgfx symbols
+        let mgfx = unknown.children.iter().find(|c| c.name == "mgfx").unwrap();
+        assert_eq!(mgfx.size, 300);
+        assert_eq!(mgfx.children.len(), 2);
+
+        // __ cluster should contain the 2 aeabi symbols
+        let dunder = unknown.children.iter().find(|c| c.name == "__").unwrap();
+        assert_eq!(dunder.size, 110);
+        assert_eq!(dunder.children.len(), 2);
     }
 
     #[test]
