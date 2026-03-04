@@ -299,4 +299,27 @@ mod tests {
         // gp_bond_sync → strip gp_ → "bond"
         assert_eq!(extract_prefix("gp_bond_sync"), "bond");
     }
+
+    #[test]
+    fn test_extract_prefix_underscore_split() {
+        assert_eq!(extract_prefix("mgfx_carousel_update"), "mgfx");
+        assert_eq!(extract_prefix("bond_action_str"), "bond");
+        assert_eq!(extract_prefix("CSWTCH.2"), "CSWTCH");
+        assert_eq!(extract_prefix("IS31FL3763_LED_ADDRESS_H"), "IS31FL3763");
+    }
+
+    #[test]
+    fn test_extract_prefix_camel_case_split() {
+        // No underscore or dot — split on camelCase boundary
+        assert_eq!(extract_prefix("localtime"), "localtime");
+        assert_eq!(extract_prefix("brainpoolP256r1"), "brainpool");
+    }
+
+    #[test]
+    fn test_extract_prefix_no_split() {
+        // All uppercase or no boundary found — whole name
+        assert_eq!(extract_prefix("strcmp"), "strcmp");
+        assert_eq!(extract_prefix("sin"), "sin");
+        assert_eq!(extract_prefix("K"), "K");
+    }
 }
