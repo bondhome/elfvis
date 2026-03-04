@@ -195,6 +195,25 @@ fn worst_aspect(row: &[f64], side: f64, total: f64, area: f64) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// Find the deepest (most specific) node at the given point.
+pub fn hit_test(node: &LayoutNode, x: f64, y: f64) -> Option<Vec<String>> {
+    if x < node.rect.x || x > node.rect.x + node.rect.w
+        || y < node.rect.y || y > node.rect.y + node.rect.h
+    {
+        return None;
+    }
+
+    for child in &node.children {
+        if let Some(path) = hit_test(child, x, y) {
+            let mut result = vec![node.name.clone()];
+            result.extend(path);
+            return Some(result);
+        }
+    }
+
+    Some(vec![node.name.clone()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,6 +20,7 @@ features = [
   "CanvasRenderingContext2d",
   "CssStyleDeclaration",
   "Document",
+  "DomTokenList",
   "DragEvent",
   "DataTransfer",
   "Element",
