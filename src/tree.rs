@@ -308,6 +308,28 @@ mod tests {
     }
 
     #[test]
+    fn test_cluster_unknown_singletons_go_to_other() {
+        let syms = vec![
+            ResolvedSymbol { name: "mgfx_font_a".into(), size: 100, source_path: None },
+            ResolvedSymbol { name: "mgfx_font_b".into(), size: 200, source_path: None },
+            ResolvedSymbol { name: "strcmp".into(), size: 50, source_path: None },
+            ResolvedSymbol { name: "sin".into(), size: 30, source_path: None },
+        ];
+        let tree = build_tree(&syms);
+        let unknown = tree.children.iter().find(|c| c.name == "<unknown>").unwrap();
+
+        // Should have "mgfx" cluster + "<other>" (strcmp and sin are singletons)
+        let names: Vec<&str> = unknown.children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"mgfx"), "expected mgfx: {names:?}");
+        assert!(names.contains(&"<other>"), "expected <other>: {names:?}");
+        assert_eq!(unknown.children.len(), 2);
+
+        let other = unknown.children.iter().find(|c| c.name == "<other>").unwrap();
+        assert_eq!(other.children.len(), 2);
+        assert_eq!(other.size, 80);
+    }
+
+    #[test]
     fn test_cluster_unknown_groups_by_prefix() {
         let syms = vec![
             ResolvedSymbol { name: "mgfx_font_a".into(), size: 100, source_path: None },
