@@ -2,3 +2,4 @@
 /pkg
 /wasm-pack.log
 *.wasm
+.worktrees/
