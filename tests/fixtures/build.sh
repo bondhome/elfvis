@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 
 # ARM Cortex-M (thumb)
 arm-none-eabi-gcc -O0 -g -mcpu=cortex-m4 -mthumb -nostartfiles \
-  -Wl,--gc-sections \
+  -ffunction-sections -fdata-sections \
   src/arm/main.c src/arm/util.c \
   -o arm.elf
 

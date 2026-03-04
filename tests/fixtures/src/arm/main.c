@@ -3,8 +3,8 @@
 extern int32_t util_add(int32_t a, int32_t b);
 extern int32_t util_mul(int32_t a, int32_t b);
 
-const char version[] = "1.0.0";
-const uint8_t lookup_table[256] = {0};
+const char version[] __attribute__((used)) = "1.0.0";
+const uint8_t lookup_table[256] __attribute__((used)) = {0};
 
 int32_t app_init(void) {
     return util_add(1, 2);
