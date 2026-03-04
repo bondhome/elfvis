@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>elfvis</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fff; overflow: hidden; }
+    #header { height: 36px; background: #fafafa; border-bottom: 1px solid #e0e0e0; display: flex; align-items: center; padding: 0 16px; font-size: 14px; color: #333; display: none; }
+    #header span { margin-right: 16px; }
+    #header a { color: #666; cursor: pointer; text-decoration: underline; }
+    #drop-zone { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+    #drop-zone .inner { border: 2px dashed #ccc; border-radius: 12px; padding: 48px 64px; text-align: center; color: #999; font-size: 18px; }
+    #drop-zone.dragover .inner { border-color: #888; color: #666; }
+    #drop-zone.hidden { display: none; }
+    #error { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; display: none; }
+    #error .inner { background: #fff3f3; border: 1px solid #ffcccc; border-radius: 8px; padding: 32px; text-align: center; color: #cc3333; max-width: 480px; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <span id="filename"></span>
+    <span id="totalsize"></span>
+    <a id="reset">drop another file</a>
+  </div>
+  <div id="drop-zone">
+    <div class="inner">
+      <p>Drop ELF file here</p>
+      <p style="font-size:14px; margin-top:8px; color:#bbb">or click to browse</p>
+      <input type="file" id="file-input" style="display:none">
+    </div>
+  </div>
+  <div id="error"><div class="inner" id="error-msg"></div></div>
+  <canvas id="canvas"></canvas>
+  <script type="module">
+    import init from './pkg/elfvis.js';
+    await init();
+  </script>
+</body>
+</html>
