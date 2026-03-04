@@ -94,6 +94,55 @@ fn compute_sizes(node: &mut SizeNode) {
     node.children.sort_by(|a, b| b.size.cmp(&a.size));
 }
 
+/// Extract a cluster prefix from a symbol name.
+///
+/// Rules (applied in order):
+/// 1. `__*` → `"__"`
+/// 2. `_*`  → `"_"`
+/// 3. `gp_*` → strip `gp_`, extract token from remainder
+/// 4. Single lowercase + `_` (Hungarian) → strip 2, extract token from remainder
+/// 5. Single lowercase + uppercase (Hungarian) → strip 1, extract token from remainder
+/// 6. Default → first token split on `_`, `.`, or camelCase boundary
+fn extract_prefix(name: &str) -> String {
+    if name.starts_with("__") {
+        return "__".to_string();
+    }
+    if name.starts_with('_') {
+        return "_".to_string();
+    }
+
+    // Hungarian notation: gp_ or single lowercase + (_ or uppercase)
+    let chars: Vec<char> = name.chars().collect();
+    let rest = if name.starts_with("gp_") {
+        &name[3..]
+    } else if chars.len() >= 2 && chars[0].is_lowercase() {
+        if chars[1] == '_' {
+            &name[2..]
+        } else if chars[1].is_uppercase() {
+            &name[1..]
+        } else {
+            name
+        }
+    } else {
+        name
+    };
+
+    // Split on first underscore or dot
+    if let Some(idx) = rest.find(|c: char| c == '_' || c == '.') {
+        return rest[..idx].to_string();
+    }
+
+    // Split on camelCase boundary (lowercase → uppercase)
+    let rchars: Vec<char> = rest.chars().collect();
+    for i in 1..rchars.len() {
+        if rchars[i].is_uppercase() && rchars[i - 1].is_lowercase() {
+            return rest[..i].to_string();
+        }
+    }
+
+    rest.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +264,19 @@ mod tests {
         let dir = &tree.children[0];
         assert_eq!(dir.name, "dir");
         assert_eq!(dir.children.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_prefix_double_underscore() {
+        assert_eq!(extract_prefix("__aeabi_dmul"), "__");
+        assert_eq!(extract_prefix("__ieee754_powf"), "__");
+        assert_eq!(extract_prefix("__kernel_cos"), "__");
+    }
+
+    #[test]
+    fn test_extract_prefix_single_underscore() {
+        assert_eq!(extract_prefix("_vfprintf_r"), "_");
+        assert_eq!(extract_prefix("_malloc_r"), "_");
+        assert_eq!(extract_prefix("_strtod_l"), "_");
     }
 }
