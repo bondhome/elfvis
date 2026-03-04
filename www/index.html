@@ -3,39 +3,316 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>elfvis</title>
+  <title>elfvis — ELF binary size visualizer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fff; overflow: hidden; }
-    #header { height: 36px; background: #fafafa; border-bottom: 1px solid #e0e0e0; display: flex; align-items: center; padding: 0 16px; font-size: 14px; color: #333; display: none; }
-    #header span { margin-right: 16px; }
-    #header a { color: #666; cursor: pointer; text-decoration: underline; }
-    #drop-zone { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
-    #drop-zone .inner { border: 2px dashed #ccc; border-radius: 12px; padding: 48px 64px; text-align: center; color: #999; font-size: 18px; }
-    #drop-zone.dragover .inner { border-color: #888; color: #666; }
+
+    :root {
+      --bg: #111113;
+      --bg-raised: #1a1a1e;
+      --bg-header: #18181b;
+      --border: #2a2a2e;
+      --border-hover: #4a4a50;
+      --text: #e4e4e7;
+      --text-muted: #71717a;
+      --text-dim: #52525b;
+      --accent: #3b82f6;
+      --accent-dim: #2563eb;
+      --mono: "JetBrains Mono", "SF Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    }
+
+    body {
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      overflow: hidden;
+    }
+
+    /* ── Header bar (shown when file is loaded) ── */
+    #header {
+      height: 36px;
+      background: var(--bg-header);
+      border-bottom: 1px solid var(--border);
+      display: none;
+      align-items: center;
+      padding: 0 12px;
+      font-size: 13px;
+      color: var(--text-muted);
+      gap: 4px;
+    }
+
+    #header .brand {
+      font-family: var(--mono);
+      font-weight: 700;
+      font-size: 13px;
+      color: var(--text);
+      letter-spacing: -0.02em;
+      margin-right: 4px;
+      text-decoration: none;
+    }
+
+    #header .sep {
+      color: var(--border);
+      margin: 0 4px;
+      user-select: none;
+    }
+
+    #header #filename {
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    #header #totalsize {
+      color: var(--text-muted);
+    }
+
+    #header .spacer { flex: 1; }
+
+    #header #reset {
+      color: var(--text-dim);
+      cursor: pointer;
+      text-decoration: none;
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      transition: all 0.15s;
+    }
+    #header #reset:hover {
+      color: var(--text);
+      background: rgba(255,255,255,0.06);
+    }
+
+    #header .gh-link {
+      display: flex;
+      align-items: center;
+      color: var(--text-dim);
+      text-decoration: none;
+      padding: 4px;
+      border-radius: 4px;
+      margin-left: 4px;
+      transition: all 0.15s;
+    }
+    #header .gh-link:hover {
+      color: var(--text);
+      background: rgba(255,255,255,0.06);
+    }
+    #header .gh-link svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    /* ── Splash / drop zone ── */
+    #drop-zone {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+    }
+
+    #drop-zone .inner {
+      border: 1.5px dashed var(--border);
+      border-radius: 16px;
+      padding: 56px 72px;
+      text-align: center;
+      transition: all 0.25s ease;
+      position: relative;
+    }
+
+    #drop-zone.dragover .inner {
+      border-color: var(--accent);
+      background: rgba(59, 130, 246, 0.04);
+      transform: scale(1.01);
+    }
+
+    #drop-zone .upload-icon {
+      width: 40px;
+      height: 40px;
+      margin: 0 auto 24px;
+      color: var(--text-dim);
+      transition: color 0.25s;
+    }
+    #drop-zone.dragover .upload-icon {
+      color: var(--accent);
+    }
+
+    #drop-zone .tool-name {
+      font-family: var(--mono);
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -0.03em;
+      margin-bottom: 4px;
+    }
+
+    #drop-zone .tool-desc {
+      font-size: 14px;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+    }
+
+    #drop-zone .drop-prompt {
+      font-size: 15px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    #drop-zone .browse-hint {
+      font-size: 13px;
+      color: var(--text-dim);
+      cursor: pointer;
+    }
+    #drop-zone .browse-hint span {
+      color: var(--accent);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+
+    #drop-zone .meta {
+      margin-top: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+
+    #drop-zone .meta a {
+      color: var(--text-dim);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+    #drop-zone .meta a:hover {
+      color: var(--text-muted);
+    }
+
+    #drop-zone .meta .dot {
+      opacity: 0.4;
+    }
+
+    #drop-zone .bond-mark {
+      position: absolute;
+      bottom: -48px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 11px;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+    #drop-zone .bond-mark a {
+      color: var(--text-dim);
+      text-decoration: none;
+      font-weight: 500;
+      transition: color 0.15s;
+    }
+    #drop-zone .bond-mark a:hover {
+      color: var(--text-muted);
+    }
+
+    /* ── Corner GitHub link (splash screen) ── */
+    .corner-gh {
+      position: fixed;
+      top: 12px;
+      right: 14px;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-dim);
+      text-decoration: none;
+      font-size: 12px;
+      padding: 5px 10px;
+      border-radius: 6px;
+      transition: all 0.15s;
+      font-family: var(--sans);
+    }
+    .corner-gh:hover {
+      color: var(--text);
+      background: rgba(255,255,255,0.06);
+    }
+    .corner-gh svg {
+      width: 18px;
+      height: 18px;
+    }
+    .corner-gh.hidden { display: none; }
+
     #drop-zone.hidden { display: none; }
-    #error { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; display: none; }
-    #error .inner { background: #fff3f3; border: 1px solid #ffcccc; border-radius: 8px; padding: 32px; text-align: center; color: #cc3333; max-width: 480px; }
+
+    /* ── Error display ── */
+    #error {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+    }
+    #error .inner {
+      background: #1f1315;
+      border: 1px solid #3f1d22;
+      border-radius: 8px;
+      padding: 32px;
+      text-align: center;
+      color: #f87171;
+      max-width: 480px;
+      font-size: 14px;
+    }
+
     canvas { display: block; }
   </style>
 </head>
 <body>
+  <!-- Corner GitHub link (visible on splash, hidden when file loaded) -->
+  <a class="corner-gh" id="corner-gh" href="https://github.com/bondhome/elfvis" target="_blank" rel="noopener">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+  </a>
+
+  <!-- Header bar (shown when file is loaded) -->
   <div id="header">
+    <a class="brand" href="https://github.com/bondhome/elfvis" target="_blank" rel="noopener">elfvis</a>
+    <span class="sep">/</span>
     <span id="filename"></span>
+    <span class="sep">&middot;</span>
     <span id="totalsize"></span>
-    <a id="reset">drop another file</a>
+    <span class="spacer"></span>
+    <a id="reset">load another file</a>
+    <a class="gh-link" href="https://github.com/bondhome/elfvis" target="_blank" rel="noopener" title="View on GitHub">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+    </a>
   </div>
+
+  <!-- Splash / drop zone -->
   <div id="drop-zone">
     <div class="inner">
-      <p style="font-size:24px; font-weight:600; color:#666; margin-bottom:4px;">elfvis</p>
-      <p>Drop ELF file here</p>
-      <p style="font-size:14px; margin-top:8px; color:#bbb">or click to browse</p>
+      <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <p class="tool-name">elfvis</p>
+      <p class="tool-desc">ELF binary size treemap visualizer</p>
+      <p class="drop-prompt">Drop an ELF file here</p>
+      <p class="browse-hint">or <span>browse</span> to select</p>
       <input type="file" id="file-input" style="display:none">
-      <p id="build-info" style="font-size:11px; margin-top:24px; color:#ccc;"></p>
+      <div class="meta">
+        <span id="build-info"></span>
+      </div>
+      <div class="bond-mark">an open-source tool by <a href="https://bondhome.io" target="_blank" rel="noopener">Bond Home</a></div>
     </div>
   </div>
+
+  <!-- Error display -->
   <div id="error"><div class="inner" id="error-msg"></div></div>
+
+  <!-- Treemap canvas -->
   <canvas id="canvas"></canvas>
+
   <script type="module">
     import init from './pkg/elfvis.js';
     await init();

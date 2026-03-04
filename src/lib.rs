@@ -42,7 +42,7 @@ pub fn main() -> Result<(), JsValue> {
         let version = env!("CARGO_PKG_VERSION");
         let build_time = env!("ELFVIS_BUILD_TIME");
         el.set_inner_html(&format!(
-            "v{version} &middot; built {build_time} &middot; <a href=\"https://github.com/bondhome/elfvis\" style=\"color:#ccc\">github</a>"
+            "v{version} &middot; built {build_time}"
         ));
     }
 
@@ -67,6 +67,10 @@ pub fn main() -> Result<(), JsValue> {
             .unchecked_ref::<HtmlElement>().style().set_property("display", "none").ok();
         doc.get_element_by_id("drop-zone").unwrap()
             .unchecked_ref::<HtmlElement>().class_list().remove_1("hidden").ok();
+        // Show corner GitHub link again on splash
+        if let Some(corner) = doc.get_element_by_id("corner-gh") {
+            corner.unchecked_ref::<HtmlElement>().class_list().remove_1("hidden").ok();
+        }
 
         let canvas: HtmlCanvasElement = doc.get_element_by_id("canvas").unwrap().unchecked_into();
         let ctx = canvas.get_context("2d").unwrap().unwrap()
@@ -214,6 +218,10 @@ fn process_elf(filename: &str, data: &[u8]) {
 fn show_header(document: &Document, filename: &str, total_size: u64) {
     let header = document.get_element_by_id("header").unwrap();
     header.unchecked_ref::<HtmlElement>().style().set_property("display", "flex").ok();
+    // Hide corner GitHub link (header has its own)
+    if let Some(corner) = document.get_element_by_id("corner-gh") {
+        corner.unchecked_ref::<HtmlElement>().class_list().add_1("hidden").ok();
+    }
     document.get_element_by_id("filename").unwrap().set_text_content(Some(filename));
     let size_str = format_size(total_size);
     document.get_element_by_id("totalsize").unwrap().set_text_content(Some(&format!("Flash: {size_str}")));
