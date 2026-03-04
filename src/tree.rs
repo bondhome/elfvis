@@ -308,6 +308,25 @@ mod tests {
     }
 
     #[test]
+    fn test_cluster_unknown_hungarian_merges() {
+        let syms = vec![
+            ResolvedSymbol { name: "Vitals_Init".into(), size: 100, source_path: None },
+            ResolvedSymbol { name: "g_vitals_keys".into(), size: 50, source_path: None },
+            ResolvedSymbol { name: "gp_vitals_ptr".into(), size: 30, source_path: None },
+        ];
+        let tree = build_tree(&syms);
+        let unknown = tree.children.iter().find(|c| c.name == "<unknown>").unwrap();
+
+        // "vitals" cluster: g_vitals_keys + gp_vitals_ptr (2 syms)
+        // "Vitals" singleton → <other>
+        let names: Vec<&str> = unknown.children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"vitals"), "expected vitals cluster: {names:?}");
+        let vitals = unknown.children.iter().find(|c| c.name == "vitals").unwrap();
+        assert_eq!(vitals.children.len(), 2);
+        assert_eq!(vitals.size, 80);
+    }
+
+    #[test]
     fn test_cluster_unknown_singletons_go_to_other() {
         let syms = vec![
             ResolvedSymbol { name: "mgfx_font_a".into(), size: 100, source_path: None },
