@@ -1,3 +1,4 @@
+use gimli::{RunTimeEndian, SectionId};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind};
 
 /// A symbol extracted from the ELF, located in a flash section.
@@ -51,6 +52,118 @@ pub fn extract_flash_symbols(data: &[u8]) -> Result<Vec<FlashSymbol>, String> {
     Ok(symbols)
 }
 
+/// A symbol with its source file path resolved from DWARF.
+#[derive(Debug, Clone)]
+pub struct ResolvedSymbol {
+    pub name: String,
+    pub size: u64,
+    /// Source file path from DWARF, or None if not found.
+    pub source_path: Option<String>,
+}
+
+/// Parse ELF + DWARF and return symbols with source paths.
+pub fn parse_elf(data: &[u8]) -> Result<Vec<ResolvedSymbol>, String> {
+    let flash_symbols = extract_flash_symbols(data)?;
+    if flash_symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let obj = object::File::parse(data).map_err(|e| format!("Failed to parse ELF: {e}"))?;
+
+    let endian = if obj.is_little_endian() {
+        RunTimeEndian::Little
+    } else {
+        RunTimeEndian::Big
+    };
+
+    let load_section =
+        |id: SectionId| -> Result<gimli::EndianSlice<'_, RunTimeEndian>, gimli::Error> {
+            let data = obj
+                .section_by_name(id.name())
+                .and_then(|s| s.data().ok())
+                .unwrap_or(&[]);
+            Ok(gimli::EndianSlice::new(data, endian))
+        };
+    let dwarf =
+        gimli::Dwarf::load(&load_section).map_err(|e| format!("Failed to load DWARF: {e}"))?;
+
+    // Check that we actually have debug info
+    let mut units = dwarf.units();
+    if units
+        .next()
+        .map_err(|e| format!("DWARF error: {e}"))?
+        .is_none()
+    {
+        return Err("Found your ELF but not your DWARF. Rebuild with `-g`.".to_string());
+    }
+
+    // Build address -> source path ranges from DWARF line programs
+    let mut addr_to_path: Vec<(u64, u64, String)> = Vec::new();
+
+    let mut units = dwarf.units();
+    while let Some(header) = units.next().map_err(|e| format!("DWARF error: {e}"))? {
+        let unit = dwarf
+            .unit(header)
+            .map_err(|e| format!("DWARF error: {e}"))?;
+        if let Some(line_program) = unit.line_program.clone() {
+            let mut rows = line_program.rows();
+            let mut prev_row: Option<(u64, String)> = None;
+
+            while let Some((header, row)) =
+                rows.next_row().map_err(|e| format!("DWARF error: {e}"))?
+            {
+                let file_path = if let Some(file) = row.file(header) {
+                    let mut path = String::new();
+                    if let Some(dir) = file.directory(header) {
+                        let dir_str = dwarf
+                            .attr_string(&unit, dir)
+                            .map_err(|e| format!("DWARF error: {e}"))?;
+                        let dir_s = dir_str.to_string_lossy();
+                        if !dir_s.is_empty() {
+                            path.push_str(&dir_s);
+                            path.push('/');
+                        }
+                    }
+                    let file_str = dwarf
+                        .attr_string(&unit, file.path_name())
+                        .map_err(|e| format!("DWARF error: {e}"))?;
+                    path.push_str(&file_str.to_string_lossy());
+                    path
+                } else {
+                    continue;
+                };
+
+                if let Some((prev_addr, ref prev_path)) = prev_row {
+                    let addr = row.address();
+                    if addr > prev_addr {
+                        addr_to_path.push((prev_addr, addr, prev_path.clone()));
+                    }
+                }
+                prev_row = Some((row.address(), file_path));
+            }
+        }
+    }
+
+    addr_to_path.sort_by_key(|&(low, _, _)| low);
+
+    let resolved: Vec<ResolvedSymbol> = flash_symbols
+        .into_iter()
+        .map(|sym| {
+            let source_path = addr_to_path
+                .iter()
+                .find(|(low, high, _)| sym.address >= *low && sym.address < *high)
+                .map(|(_, _, path)| path.clone());
+            ResolvedSymbol {
+                name: sym.name,
+                size: sym.size,
+                source_path,
+            }
+        })
+        .collect();
+
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +201,39 @@ mod tests {
     fn test_rejects_non_elf() {
         let result = extract_flash_symbols(b"not an elf");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_elf_resolves_source_paths() {
+        let symbols = parse_elf(ARM_ELF).unwrap();
+        let app_init = symbols.iter().find(|s| s.name == "app_init").unwrap();
+        let path = app_init
+            .source_path
+            .as_ref()
+            .expect("app_init should have a source path");
+        assert!(
+            path.ends_with("main.c"),
+            "app_init should come from main.c, got: {path}"
+        );
+    }
+
+    #[test]
+    fn test_parse_elf_resolves_different_files() {
+        let symbols = parse_elf(ARM_ELF).unwrap();
+        let util_add = symbols.iter().find(|s| s.name == "util_add").unwrap();
+        let path = util_add
+            .source_path
+            .as_ref()
+            .expect("util_add should have a source path");
+        assert!(
+            path.ends_with("util.c"),
+            "util_add should come from util.c, got: {path}"
+        );
+    }
+
+    #[test]
+    fn test_parse_elf_succeeds_with_dwarf() {
+        let result = parse_elf(ARM_ELF);
+        assert!(result.is_ok());
     }
 }
