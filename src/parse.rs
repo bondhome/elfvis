@@ -152,6 +152,11 @@ pub fn parse_elf(data: &[u8]) -> Result<Vec<ResolvedSymbol>, String> {
 
     addr_to_path.sort_by_key(|&(low, _, _)| low);
 
+    // Strip longest common directory prefix from all paths so the tree shows
+    // relative paths (e.g. "ctrl/Sidekick/Sidekick.h" instead of
+    // "/Users/.../bond-core/ctrl/Sidekick/Sidekick.h").
+    strip_common_prefix(&mut addr_to_path);
+
     let resolved: Vec<ResolvedSymbol> = flash_symbols
         .into_iter()
         .map(|sym| {
@@ -179,6 +184,36 @@ pub fn parse_elf(data: &[u8]) -> Result<Vec<ResolvedSymbol>, String> {
         .collect();
 
     Ok(resolved)
+}
+
+/// Strip the longest common directory prefix from all paths in the address map.
+/// Only strips at directory boundaries (i.e. at '/' characters).
+fn strip_common_prefix(entries: &mut Vec<(u64, u64, String)>) {
+    if entries.is_empty() {
+        return;
+    }
+    // Find longest common byte prefix
+    let first = entries[0].2.as_bytes();
+    let mut prefix_len = first.len();
+    for entry in entries.iter().skip(1) {
+        let other = entry.2.as_bytes();
+        prefix_len = prefix_len.min(other.len());
+        for i in 0..prefix_len {
+            if first[i] != other[i] {
+                prefix_len = i;
+                break;
+            }
+        }
+    }
+    // Trim back to last '/' boundary
+    if let Some(pos) = first[..prefix_len].iter().rposition(|&b| b == b'/') {
+        let strip = pos + 1; // include the '/'
+        if strip > 0 {
+            for entry in entries.iter_mut() {
+                entry.2 = entry.2[strip..].to_string();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -252,5 +287,47 @@ mod tests {
     fn test_parse_elf_succeeds_with_dwarf() {
         let result = parse_elf(ARM_ELF);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strip_common_prefix_absolute_paths() {
+        let mut entries = vec![
+            (0, 10, "/Users/me/eng/bond-core/ctrl/Sidekick/Sidekick.h".into()),
+            (10, 20, "/Users/me/eng/bond-core/target/mate/Sidekick.h".into()),
+            (20, 30, "/Users/me/eng/bond-core/sys/SysLog.c".into()),
+        ];
+        strip_common_prefix(&mut entries);
+        assert_eq!(entries[0].2, "ctrl/Sidekick/Sidekick.h");
+        assert_eq!(entries[1].2, "target/mate/Sidekick.h");
+        assert_eq!(entries[2].2, "sys/SysLog.c");
+    }
+
+    #[test]
+    fn test_strip_common_prefix_no_common() {
+        let mut entries = vec![
+            (0, 10, "src/main.c".into()),
+            (10, 20, "/opt/gcc/include/stdio.h".into()),
+        ];
+        strip_common_prefix(&mut entries);
+        // No common prefix — paths unchanged
+        assert_eq!(entries[0].2, "src/main.c");
+        assert_eq!(entries[1].2, "/opt/gcc/include/stdio.h");
+    }
+
+    #[test]
+    fn test_strip_common_prefix_empty() {
+        let mut entries: Vec<(u64, u64, String)> = vec![];
+        strip_common_prefix(&mut entries);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_strip_common_prefix_single() {
+        let mut entries = vec![
+            (0, 10, "/a/b/c/file.c".into()),
+        ];
+        strip_common_prefix(&mut entries);
+        // Single entry: prefix is entire path, trimmed to last dir boundary = "file.c"
+        assert_eq!(entries[0].2, "file.c");
     }
 }

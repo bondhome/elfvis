@@ -131,7 +131,16 @@ pub fn render_tooltip(ctx: &CanvasRenderingContext2d, x: f64, y: f64, text: &str
     let lines: Vec<&str> = text.lines().collect();
     let line_height = 16.0;
     let padding = 8.0;
-    let tooltip_w = 280.0;
+
+    // Set font before measuring
+    let font = "12px \"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
+    ctx.set_font(font);
+
+    // Measure widest line to size tooltip dynamically
+    let max_line_w = lines.iter()
+        .filter_map(|line| ctx.measure_text(line).ok().map(|m| m.width()))
+        .fold(0.0_f64, f64::max);
+    let tooltip_w = max_line_w + padding * 2.0;
     let tooltip_h = lines.len() as f64 * line_height + padding * 2.0;
 
     let mut tx = x + 12.0;
@@ -147,7 +156,6 @@ pub fn render_tooltip(ctx: &CanvasRenderingContext2d, x: f64, y: f64, text: &str
     ctx.fill();
 
     ctx.set_fill_style_str("#ffffff");
-    ctx.set_font("12px \"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace");
     ctx.set_text_baseline("top");
     for (i, line) in lines.iter().enumerate() {
         ctx.fill_text(line, tx + padding, ty + padding + i as f64 * line_height).ok();
