@@ -21,8 +21,8 @@ pub struct LayoutNode {
     pub children: Vec<LayoutNode>,
 }
 
-pub const HEADER_HEIGHT: f64 = 18.0;
-pub const MIN_HEADER_HEIGHT: f64 = 24.0;
+pub const HEADER_HEIGHT: f64 = 14.0;
+pub const MIN_HEADER_HEIGHT: f64 = 19.0;
 pub const PADDING: f64 = 1.0;
 
 /// Lay out a `SizeNode` tree as a squarified treemap within the given canvas dimensions.
