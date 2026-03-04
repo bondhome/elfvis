@@ -150,6 +150,78 @@ pub fn parse_elf(data: &[u8]) -> Result<Vec<ResolvedSymbol>, String> {
         }
     }
 
+    // Level 2: Walk DW_TAG_variable DIEs to attribute data symbols.
+    // For each variable with DW_AT_location containing DW_OP_addr,
+    // resolve DW_AT_decl_file to a source path and add a point range.
+    let mut var_units = dwarf.units();
+    while let Some(header) = var_units.next().map_err(|e| format!("DWARF error: {e}"))? {
+        let unit = dwarf
+            .unit(header)
+            .map_err(|e| format!("DWARF error: {e}"))?;
+
+        // We need the line program header to resolve DW_AT_decl_file indices
+        let line_header = match &unit.line_program {
+            Some(lp) => lp.header().clone(),
+            None => continue,
+        };
+
+        let mut entries = unit.entries();
+        while let Some((_, entry)) = entries.next_dfs().map_err(|e| format!("DWARF error: {e}"))? {
+            if entry.tag() != gimli::DW_TAG_variable {
+                continue;
+            }
+
+            // Need DW_AT_location with DW_OP_addr
+            let address = match entry
+                .attr_value(gimli::DW_AT_location)
+                .map_err(|e| format!("DWARF error: {e}"))?
+            {
+                Some(gimli::AttributeValue::Exprloc(expr)) => {
+                    let mut ops = expr.operations(unit.encoding());
+                    match ops.next() {
+                        Ok(Some(gimli::Operation::Address { address })) => address,
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+
+            // Resolve DW_AT_decl_file to source path
+            let file_index = match entry
+                .attr_value(gimli::DW_AT_decl_file)
+                .map_err(|e| format!("DWARF error: {e}"))?
+            {
+                Some(gimli::AttributeValue::FileIndex(idx)) => idx,
+                _ => continue,
+            };
+
+            let file_path = match line_header.file(file_index) {
+                Some(file) => {
+                    let mut path = String::new();
+                    if let Some(dir) = file.directory(&line_header) {
+                        let dir_str = dwarf
+                            .attr_string(&unit, dir)
+                            .map_err(|e| format!("DWARF error: {e}"))?;
+                        let dir_s = dir_str.to_string_lossy();
+                        if !dir_s.is_empty() {
+                            path.push_str(&dir_s);
+                            path.push('/');
+                        }
+                    }
+                    let file_str = dwarf
+                        .attr_string(&unit, file.path_name())
+                        .map_err(|e| format!("DWARF error: {e}"))?;
+                    path.push_str(&file_str.to_string_lossy());
+                    path
+                }
+                None => continue,
+            };
+
+            // Add point range so binary search picks up this address
+            addr_to_path.push((address, address + 1, file_path));
+        }
+    }
+
     addr_to_path.sort_by_key(|&(low, _, _)| low);
 
     // Strip longest common directory prefix from all paths so the tree shows
