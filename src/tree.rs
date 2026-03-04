@@ -226,7 +226,7 @@ mod tests {
         let names: Vec<&str> = tree.children.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"src"), "should have src dir: {names:?}");
         assert!(
-            names.contains(&"<unknown>"),
+            names.iter().any(|n| n.starts_with("<unknown>")),
             "should have <unknown>: {names:?}"
         );
     }
@@ -251,7 +251,8 @@ mod tests {
     #[test]
     fn test_unknown_bucket() {
         let tree = build_tree(&make_symbols());
-        let unknown = tree.children.iter().find(|c| c.name == "<unknown>").unwrap();
+        // Single unknown sym is a singleton → lands in <other>, collapsed to <unknown>/<other>
+        let unknown = tree.children.iter().find(|c| c.name.starts_with("<unknown>")).unwrap();
         assert_eq!(unknown.size, 30);
     }
 
@@ -259,7 +260,7 @@ mod tests {
     fn test_children_sorted_by_size_desc() {
         let tree = build_tree(&make_symbols());
         assert_eq!(tree.children[0].name, "src");
-        assert_eq!(tree.children[1].name, "<unknown>");
+        assert!(tree.children[1].name.starts_with("<unknown>"));
     }
 
     #[test]
