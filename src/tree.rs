@@ -279,4 +279,24 @@ mod tests {
         assert_eq!(extract_prefix("_malloc_r"), "_");
         assert_eq!(extract_prefix("_strtod_l"), "_");
     }
+
+    #[test]
+    fn test_extract_prefix_hungarian_underscore() {
+        // g_vitals_keys → strip g_ → "vitals"
+        assert_eq!(extract_prefix("g_vitals_keys"), "vitals");
+        // s_buffer_ptr → strip s_ → "buffer"
+        assert_eq!(extract_prefix("s_buffer_ptr"), "buffer");
+    }
+
+    #[test]
+    fn test_extract_prefix_hungarian_camel() {
+        // aGpioConfigList → strip a → "Gpio" (camelCase split on GpioConfigList)
+        assert_eq!(extract_prefix("aGpioConfigList"), "Gpio");
+    }
+
+    #[test]
+    fn test_extract_prefix_gp_hungarian() {
+        // gp_bond_sync → strip gp_ → "bond"
+        assert_eq!(extract_prefix("gp_bond_sync"), "bond");
+    }
 }
