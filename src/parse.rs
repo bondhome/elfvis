@@ -330,4 +330,22 @@ mod tests {
         // Single entry: prefix is entire path, trimmed to last dir boundary = "file.c"
         assert_eq!(entries[0].2, "file.c");
     }
+
+    #[test]
+    fn test_variable_die_attributes_rodata_symbol() {
+        // The arm.elf fixture has 'version' in .rodata defined in main.c.
+        // Line tables don't cover .rodata addresses, but DW_TAG_variable
+        // DIEs should provide the attribution.
+        let symbols = parse_elf(ARM_ELF).unwrap();
+        let version = symbols.iter().find(|s| s.name == "version").unwrap();
+        assert!(
+            version.source_path.is_some(),
+            "version (.rodata) should be attributed via DW_TAG_variable DIE, got None"
+        );
+        let path = version.source_path.as_ref().unwrap();
+        assert!(
+            path.contains("main.c"),
+            "version should be attributed to main.c, got: {path}"
+        );
+    }
 }
