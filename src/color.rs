@@ -43,6 +43,39 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> Color {
     }
 }
 
+/// Map a size-change percentage to a green-white-red color.
+/// - negative % → green (shrank)
+/// - zero → white/neutral
+/// - positive % → red (grew)
+/// - INFINITY → bright green (new symbol)
+/// - NEG_INFINITY → bright red (removed symbol)
+pub fn delta_color(pct: f64) -> Color {
+    if pct == f64::INFINITY {
+        return Color { r: 72, g: 199, b: 142 }; // bright green — new
+    }
+    if pct == f64::NEG_INFINITY {
+        return Color { r: 239, g: 68, b: 68 }; // bright red — removed
+    }
+
+    // Clamp to [-100, 100] for interpolation
+    let t = pct.clamp(-100.0, 100.0) / 100.0;
+
+    if t >= 0.0 {
+        // white → red
+        let r = 255;
+        let g = (255.0 * (1.0 - t * 0.7)) as u8;
+        let b = (255.0 * (1.0 - t * 0.7)) as u8;
+        Color { r, g, b }
+    } else {
+        // white → green
+        let at = t.abs();
+        let r = (255.0 * (1.0 - at * 0.7)) as u8;
+        let g = 255;
+        let b = (255.0 * (1.0 - at * 0.7)) as u8;
+        Color { r, g, b }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +119,36 @@ mod tests {
     fn test_hue_wraps() {
         let c = pastel_color(720.0, 0);
         assert!(c.r > 100, "wrapped hue should still produce valid color");
+    }
+
+    #[test]
+    fn test_delta_color_zero_is_neutral() {
+        let c = super::delta_color(0.0);
+        assert!((c.r as i32 - c.g as i32).abs() < 20, "zero delta should be neutral");
+        assert!((c.g as i32 - c.b as i32).abs() < 20, "zero delta should be neutral");
+    }
+
+    #[test]
+    fn test_delta_color_positive_is_red() {
+        let c = super::delta_color(50.0);
+        assert!(c.r > c.g, "positive delta should be reddish: r={}, g={}", c.r, c.g);
+    }
+
+    #[test]
+    fn test_delta_color_negative_is_green() {
+        let c = super::delta_color(-50.0);
+        assert!(c.g > c.r, "negative delta should be greenish: r={}, g={}", c.r, c.g);
+    }
+
+    #[test]
+    fn test_delta_color_new_symbol() {
+        let c = super::delta_color(f64::INFINITY);
+        assert!(c.g > 150, "new symbol should be bright green, got g={}", c.g);
+    }
+
+    #[test]
+    fn test_delta_color_removed_symbol() {
+        let c = super::delta_color(f64::NEG_INFINITY);
+        assert!(c.r > 150, "removed symbol should be bright red, got r={}", c.r);
     }
 }
