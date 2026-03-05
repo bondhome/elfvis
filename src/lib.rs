@@ -20,6 +20,12 @@ struct AppState {
     canvas_width: f64,
     canvas_height: f64,
     dpr: f64,
+    // Comparison mode
+    size_tree: Option<tree::SizeNode>,
+    compare_layout: Option<layout::LayoutNode>,
+    compare_filename: String,
+    compare_total_size: u64,
+    diff_map: Option<std::collections::HashMap<String, diff::Delta>>,
 }
 
 thread_local! {
@@ -30,6 +36,11 @@ thread_local! {
         canvas_width: 0.0,
         canvas_height: 0.0,
         dpr: 1.0,
+        size_tree: None,
+        compare_layout: None,
+        compare_filename: String::new(),
+        compare_total_size: 0,
+        diff_map: None,
     });
 }
 
@@ -79,6 +90,30 @@ pub fn main() -> Result<(), JsValue> {
         ctx.clear_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
     }) as Box<dyn FnMut(_)>);
     reset.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+    cb.forget();
+
+    // Compare button
+    let compare_btn = document.get_element_by_id("compare-btn").unwrap();
+    let cb = Closure::wrap(Box::new(move |_: Event| {
+        let doc = window().unwrap().document().unwrap();
+        let input: HtmlInputElement = doc.get_element_by_id("file-input-b").unwrap().unchecked_into();
+        input.click();
+    }) as Box<dyn FnMut(_)>);
+    compare_btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+    cb.forget();
+
+    // Compare file input
+    let input_b: HtmlInputElement = document.get_element_by_id("file-input-b").unwrap().unchecked_into();
+    let cb = Closure::wrap(Box::new(move |_: Event| {
+        let doc = window().unwrap().document().unwrap();
+        let input: HtmlInputElement = doc.get_element_by_id("file-input-b").unwrap().unchecked_into();
+        if let Some(files) = input.files() {
+            if let Some(file) = files.get(0) {
+                load_compare_file(file);
+            }
+        }
+    }) as Box<dyn FnMut(_)>);
+    input_b.add_event_listener_with_callback("change", cb.as_ref().unchecked_ref())?;
     cb.forget();
 
     Ok(())
@@ -180,6 +215,7 @@ fn process_elf(filename: &str, data: &[u8]) {
 
             STATE.with(|s| {
                 let mut state = s.borrow_mut();
+                state.size_tree = Some(size_tree);
                 state.layout_root = Some(layout_root);
                 state.filename = filename.to_string();
                 state.total_size = total_size;
@@ -226,6 +262,10 @@ fn show_header(document: &Document, filename: &str, total_size: u64) {
     document.get_element_by_id("filename").unwrap().set_text_content(Some(filename));
     let size_str = format_size(total_size);
     document.get_element_by_id("totalsize").unwrap().set_text_content(Some(&format!("Flash: {size_str}")));
+
+    if let Some(btn) = document.get_element_by_id("compare-btn") {
+        btn.unchecked_ref::<HtmlElement>().style().set_property("display", "").ok();
+    }
 }
 
 fn show_error(document: &Document, msg: &str) {
@@ -242,6 +282,136 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+fn load_compare_file(file: web_sys::File) {
+    let filename = file.name();
+    let reader = FileReader::new().unwrap();
+    let r = reader.clone();
+    let cb = Closure::wrap(Box::new(move |_: Event| {
+        let array_buffer = r.result().unwrap();
+        let uint8_array = js_sys::Uint8Array::new(&array_buffer);
+        let data = uint8_array.to_vec();
+        process_compare_elf(&filename, &data);
+    }) as Box<dyn FnMut(_)>);
+    reader.set_onload(Some(cb.as_ref().unchecked_ref()));
+    cb.forget();
+    reader.read_as_array_buffer(&file).unwrap();
+}
+
+fn process_compare_elf(filename: &str, data: &[u8]) {
+    let document = window().unwrap().document().unwrap();
+
+    match parse::parse_elf(data) {
+        Ok(symbols) => {
+            let size_tree_b = tree::build_tree(&symbols);
+            let total_b = size_tree_b.size;
+            let win = window().unwrap();
+            let full_w = win.inner_width().unwrap().as_f64().unwrap();
+            let h = win.inner_height().unwrap().as_f64().unwrap() - 36.0;
+            let half_w = (full_w - 2.0) / 2.0;
+            let dpr = win.device_pixel_ratio();
+
+            let layout_b = layout::layout(&size_tree_b, half_w, h);
+            let paths_b = tree::flatten_paths(&size_tree_b);
+
+            // Re-layout tree A at half width and compute diff
+            STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                let paths_a = state.size_tree.as_ref()
+                    .map(|t| tree::flatten_paths(t))
+                    .unwrap_or_default();
+
+                if let Some(ref tree_a) = state.size_tree {
+                    state.layout_root = Some(layout::layout(tree_a, half_w, h));
+                }
+
+                let diff_map = diff::compute_diff(&paths_a, &paths_b);
+
+                state.compare_layout = Some(layout_b);
+                state.compare_filename = filename.to_string();
+                state.compare_total_size = total_b;
+                state.diff_map = Some(diff_map);
+                state.canvas_width = half_w;
+                state.canvas_height = h;
+                state.dpr = dpr;
+            });
+
+            // Update header
+            STATE.with(|s| {
+                let state = s.borrow();
+                let size_a = format_size(state.total_size);
+                let size_b = format_size(total_b);
+                let diff = total_b as i64 - state.total_size as i64;
+                let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
+                let diff_str = format!("{sign}{}", format_size(abs_diff));
+                let pct = if state.total_size > 0 {
+                    diff as f64 / state.total_size as f64 * 100.0
+                } else {
+                    0.0
+                };
+                document.get_element_by_id("filename").unwrap()
+                    .set_text_content(Some(&format!("{} vs {}", state.filename, filename)));
+                document.get_element_by_id("totalsize").unwrap()
+                    .set_text_content(Some(&format!("{size_a} → {size_b} ({diff_str}, {pct:+.1}%)")));
+            });
+
+            // Hide compare button
+            if let Some(btn) = document.get_element_by_id("compare-btn") {
+                btn.unchecked_ref::<HtmlElement>().style().set_property("display", "none").ok();
+            }
+
+            // Show comparison UI
+            document.get_element_by_id("compare-divider").unwrap()
+                .unchecked_ref::<HtmlElement>().style().set_property("display", "").ok();
+            let canvas_b: HtmlCanvasElement = document.get_element_by_id("canvas-b").unwrap().unchecked_into();
+            canvas_b.style().set_property("display", "").ok();
+            document.get_element_by_id("canvas-container").unwrap()
+                .unchecked_ref::<HtmlElement>().class_list().add_1("compare-mode").ok();
+
+            // Resize canvas A
+            let canvas_a: HtmlCanvasElement = document.get_element_by_id("canvas").unwrap().unchecked_into();
+            canvas_a.set_width((half_w * dpr) as u32);
+            canvas_a.set_height((h * dpr) as u32);
+            canvas_a.style().set_property("width", &format!("{half_w}px")).ok();
+            canvas_a.style().set_property("height", &format!("{h}px")).ok();
+
+            // Set up canvas B
+            canvas_b.set_width((half_w * dpr) as u32);
+            canvas_b.set_height((h * dpr) as u32);
+            canvas_b.style().set_property("width", &format!("{half_w}px")).ok();
+            canvas_b.style().set_property("height", &format!("{h}px")).ok();
+
+            // Render both
+            render_comparison(dpr);
+        }
+        Err(msg) => {
+            show_error(&document, &msg);
+        }
+    }
+}
+
+fn render_comparison(dpr: f64) {
+    let document = window().unwrap().document().unwrap();
+
+    STATE.with(|s| {
+        let state = s.borrow();
+        if let (Some(ref root_a), Some(ref root_b), Some(ref deltas)) =
+            (&state.layout_root, &state.compare_layout, &state.diff_map)
+        {
+            let canvas_a: HtmlCanvasElement = document.get_element_by_id("canvas").unwrap().unchecked_into();
+            let ctx_a = canvas_a.get_context("2d").unwrap().unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx_a.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
+            render::render_diff(&ctx_a, root_a, deltas);
+
+            let canvas_b: HtmlCanvasElement = document.get_element_by_id("canvas-b").unwrap().unchecked_into();
+            let ctx_b = canvas_b.get_context("2d").unwrap().unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx_b.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
+            render::render_diff(&ctx_b, root_b, deltas);
+        }
+    });
 }
 
 fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
