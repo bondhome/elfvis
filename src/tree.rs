@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 /// A node in the size tree.
 #[derive(Debug, Clone)]
 pub struct SizeNode {
@@ -7,6 +9,37 @@ pub struct SizeNode {
     pub size: u64,
     /// Child nodes. Empty for leaf (symbol) nodes.
     pub children: Vec<SizeNode>,
+}
+
+/// Flatten a SizeNode tree into a map of full path -> leaf size.
+/// Only leaf nodes (symbols) are included.
+pub fn flatten_paths(tree: &SizeNode) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    flatten_recursive(tree, &mut String::new(), &mut map);
+    map
+}
+
+fn flatten_recursive(node: &SizeNode, prefix: &mut String, map: &mut HashMap<String, u64>) {
+    if node.children.is_empty() && !node.name.is_empty() {
+        let key = if prefix.is_empty() {
+            node.name.clone()
+        } else {
+            format!("{}/{}", prefix, node.name)
+        };
+        map.insert(key, node.size);
+        return;
+    }
+    for child in &node.children {
+        let old_len = prefix.len();
+        if !node.name.is_empty() {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(&node.name);
+        }
+        flatten_recursive(child, prefix, map);
+        prefix.truncate(old_len);
+    }
 }
 
 /// Build a size tree from resolved symbols.
@@ -102,8 +135,6 @@ fn compute_sizes(node: &mut SizeNode) {
 /// Regroup flat children of the `<unknown>` node into prefix-based clusters.
 /// Prefixes with fewer than 2 symbols are merged into an `<other>` catch-all.
 fn cluster_unknown_children(node: &mut SizeNode) {
-    use std::collections::HashMap;
-
     // Bucket children by prefix
     let mut buckets: HashMap<String, Vec<SizeNode>> = HashMap::new();
     for child in node.children.drain(..) {
@@ -432,5 +463,18 @@ mod tests {
         assert_eq!(extract_prefix("strcmp"), "strcmp");
         assert_eq!(extract_prefix("sin"), "sin");
         assert_eq!(extract_prefix("K"), "K");
+    }
+
+    #[test]
+    fn test_flatten_paths() {
+        let tree = build_tree(&make_symbols());
+        let paths = super::flatten_paths(&tree);
+        // func_a (100) and func_b (200) are leaves under src/app/main.c
+        assert_eq!(paths.get("src/app/main.c/func_b"), Some(&200));
+        assert_eq!(paths.get("src/app/main.c/func_a"), Some(&100));
+        assert_eq!(paths.get("src/lib/util.c/func_c"), Some(&50));
+        // Non-leaf nodes should NOT be in the map
+        assert!(!paths.contains_key("src"));
+        assert!(!paths.contains_key("src/app/main.c"));
     }
 }
