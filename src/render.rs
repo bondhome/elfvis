@@ -195,7 +195,9 @@ fn render_diff_node(
     }
 
     if node.is_leaf {
-        let color = if let Some(delta) = deltas.get(path.as_str()) {
+        // Look up by leaf name (symbol name) — not full tree path,
+        // since independent tree builds produce different clustering paths.
+        let color = if let Some(delta) = deltas.get(&node.name) {
             delta_color(delta.diff_pct())
         } else {
             delta_color(0.0)

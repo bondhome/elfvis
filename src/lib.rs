@@ -22,6 +22,7 @@ struct AppState {
     dpr: f64,
     // Comparison mode
     size_tree: Option<tree::SizeNode>,
+    symbol_sizes: Option<std::collections::HashMap<String, u64>>,
     compare_layout: Option<layout::LayoutNode>,
     compare_filename: String,
     compare_total_size: u64,
@@ -37,6 +38,7 @@ thread_local! {
         canvas_height: 0.0,
         dpr: 1.0,
         size_tree: None,
+        symbol_sizes: None,
         compare_layout: None,
         compare_filename: String::new(),
         compare_total_size: 0,
@@ -72,6 +74,7 @@ pub fn main() -> Result<(), JsValue> {
             let mut state = s.borrow_mut();
             state.layout_root = None;
             state.size_tree = None;
+            state.symbol_sizes = None;
             state.compare_layout = None;
             state.compare_filename = String::new();
             state.compare_total_size = 0;
@@ -222,6 +225,7 @@ fn process_elf(filename: &str, data: &[u8]) {
 
     match parse::parse_elf(data) {
         Ok(symbols) => {
+            let sym_map = symbols_to_map(&symbols);
             let size_tree = tree::build_tree(&symbols);
             let total_size = size_tree.size;
             let win = window().unwrap();
@@ -234,6 +238,7 @@ fn process_elf(filename: &str, data: &[u8]) {
             STATE.with(|s| {
                 let mut state = s.borrow_mut();
                 state.size_tree = Some(size_tree);
+                state.symbol_sizes = Some(sym_map);
                 state.layout_root = Some(layout_root);
                 state.filename = filename.to_string();
                 state.total_size = total_size;
@@ -302,6 +307,26 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+fn collect_leaf_names(node: &layout::LayoutNode) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_leaf_names_recursive(node, &mut names);
+    names
+}
+
+fn collect_leaf_names_recursive(node: &layout::LayoutNode, names: &mut Vec<String>) {
+    if node.is_leaf {
+        names.push(node.name.clone());
+    } else {
+        for child in &node.children {
+            collect_leaf_names_recursive(child, names);
+        }
+    }
+}
+
+fn symbols_to_map(symbols: &[parse::ResolvedSymbol]) -> std::collections::HashMap<String, u64> {
+    symbols.iter().map(|s| (s.name.clone(), s.size)).collect()
+}
+
 fn load_compare_file(file: web_sys::File) {
     let filename = file.name();
     let reader = FileReader::new().unwrap();
@@ -331,14 +356,14 @@ fn process_compare_elf(filename: &str, data: &[u8]) {
             let dpr = win.device_pixel_ratio();
 
             let layout_b = layout::layout(&size_tree_b, half_w, h);
-            let paths_b = tree::flatten_paths(&size_tree_b);
+
+            // Build diff by symbol name (not tree path, which varies due to clustering)
+            let paths_b = symbols_to_map(&symbols);
 
             // Re-layout tree A at half width and compute diff
             STATE.with(|s| {
                 let mut state = s.borrow_mut();
-                let paths_a = state.size_tree.as_ref()
-                    .map(|t| tree::flatten_paths(t))
-                    .unwrap_or_default();
+                let paths_a = state.symbol_sizes.clone().unwrap_or_default();
 
                 if let Some(ref tree_a) = state.size_tree {
                     state.layout_root = Some(layout::layout(tree_a, half_w, h));
@@ -466,20 +491,60 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
                 let other_ctx = if is_canvas_b { &ctx_a } else { &ctx_b };
                 render::render_highlight(other_ctx, other, &path[1..]);
 
-                // Build full path string for delta lookup
-                let full_path = path[1..].join("/");
+                // Walk to hovered node
+                let mut node = hovered;
+                for name in &path[1..] {
+                    if let Some(child) = node.children.iter().find(|c| c.name == *name) {
+                        node = child;
+                    } else {
+                        break;
+                    }
+                }
 
-                // Build comparison tooltip
-                let leaf_name = path.last().map(|s| s.as_str()).unwrap_or("");
-                let tooltip = if let Some(delta) = deltas.get(&full_path) {
-                    let before_str = delta.before.map(format_size).unwrap_or_else(|| "\u{2014}".into());
-                    let after_str = delta.after.map(format_size).unwrap_or_else(|| "\u{2014}".into());
-                    let diff = delta.diff_bytes();
+                let display_name = path.last().map(|s| s.as_str()).unwrap_or("");
+                let tooltip = if node.is_leaf {
+                    // Leaf: look up by symbol name
+                    if let Some(delta) = deltas.get(display_name) {
+                        let before_str = delta.before.map(format_size).unwrap_or_else(|| "\u{2014}".into());
+                        let after_str = delta.after.map(format_size).unwrap_or_else(|| "\u{2014}".into());
+                        let diff = delta.diff_bytes();
+                        let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
+                        let diff_str = format!("{sign}{}", format_size(abs_diff));
+                        format!("{display_name}\n{before_str} \u{2192} {after_str}\n{diff_str}")
+                    } else {
+                        display_name.to_string()
+                    }
+                } else {
+                    // Parent: sum diffs of all descendant leaves
+                    let leaf_names = collect_leaf_names(node);
+                    let mut total_before: u64 = 0;
+                    let mut total_after: u64 = 0;
+                    for name in &leaf_names {
+                        if let Some(delta) = deltas.get(name.as_str()) {
+                            total_before += delta.before.unwrap_or(0);
+                            total_after += delta.after.unwrap_or(0);
+                        }
+                    }
+                    let diff = total_after as i64 - total_before as i64;
                     let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
                     let diff_str = format!("{sign}{}", format_size(abs_diff));
-                    format!("{leaf_name}\n{before_str} \u{2192} {after_str}\n{diff_str}")
-                } else {
-                    leaf_name.to_string()
+                    let pct = if total_before > 0 {
+                        diff as f64 / total_before as f64 * 100.0
+                    } else if total_after > 0 {
+                        f64::INFINITY
+                    } else {
+                        0.0
+                    };
+                    let pct_str = if pct.is_finite() {
+                        format!(" ({pct:+.1}%)")
+                    } else {
+                        " (new)".to_string()
+                    };
+                    format!(
+                        "{display_name}\n{} \u{2192} {}\n{diff_str}{pct_str}",
+                        format_size(total_before),
+                        format_size(total_after),
+                    )
                 };
 
                 // Show tooltip on hovered canvas
