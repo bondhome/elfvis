@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use web_sys::CanvasRenderingContext2d;
 
-use crate::color::pastel_color;
+use crate::color::{delta_color, pastel_color};
+use crate::diff::Delta;
 use crate::layout::{LayoutNode, HEADER_HEIGHT, MIN_HEADER_HEIGHT};
 
 pub fn render(ctx: &CanvasRenderingContext2d, root: &LayoutNode) {
@@ -160,6 +163,108 @@ pub fn render_tooltip(ctx: &CanvasRenderingContext2d, x: f64, y: f64, text: &str
     for (i, line) in lines.iter().enumerate() {
         ctx.fill_text(line, tx + padding, ty + padding + i as f64 * line_height).ok();
     }
+}
+
+/// Render a treemap with delta-based coloring for comparison mode.
+pub fn render_diff(
+    ctx: &CanvasRenderingContext2d,
+    root: &LayoutNode,
+    deltas: &HashMap<String, Delta>,
+) {
+    ctx.set_fill_style_str("#ffffff");
+    ctx.fill_rect(root.rect.x, root.rect.y, root.rect.w, root.rect.h);
+    render_diff_node(ctx, root, deltas, &mut String::new());
+}
+
+fn render_diff_node(
+    ctx: &CanvasRenderingContext2d,
+    node: &LayoutNode,
+    deltas: &HashMap<String, Delta>,
+    path: &mut String,
+) {
+    if node.rect.w < 1.0 || node.rect.h < 1.0 {
+        return;
+    }
+
+    let old_len = path.len();
+    if !node.name.is_empty() {
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(&node.name);
+    }
+
+    if node.is_leaf {
+        let color = if let Some(delta) = deltas.get(path.as_str()) {
+            delta_color(delta.diff_pct())
+        } else {
+            delta_color(0.0)
+        };
+        ctx.set_fill_style_str(&color.to_css());
+        ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
+
+        ctx.set_stroke_style_str("rgba(0,0,0,1)");
+        ctx.set_line_width(0.5);
+        ctx.stroke_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
+
+        render_label(ctx, node);
+    } else {
+        let show_header = node.rect.h >= MIN_HEADER_HEIGHT && node.depth > 0;
+        if show_header {
+            ctx.set_fill_style_str("rgb(220,220,220)");
+            ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, HEADER_HEIGHT);
+
+            let pad = 4.0;
+            let max_w = node.rect.w - pad * 2.0;
+            let y_mid = node.rect.y + HEADER_HEIGHT / 2.0;
+            let mono = "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
+            let font = format!("bold 9px {mono}");
+
+            ctx.set_fill_style_str("#333333");
+            ctx.set_text_baseline("middle");
+            ctx.set_font(&font);
+
+            let name = strip_extension(&node.name);
+            if let Ok(m) = ctx.measure_text(&name) {
+                if m.width() <= max_w {
+                    ctx.fill_text(&name, node.rect.x + pad, y_mid).ok();
+                }
+            }
+        }
+
+        for child in &node.children {
+            render_diff_node(ctx, child, deltas, path);
+        }
+
+        if node.depth > 0 {
+            ctx.set_stroke_style_str("rgba(0,0,0,1)");
+            ctx.set_line_width(1.0);
+            ctx.stroke_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
+        }
+    }
+
+    path.truncate(old_len);
+}
+
+/// Draw a highlight rectangle around a node matched by path.
+pub fn render_highlight(ctx: &CanvasRenderingContext2d, root: &LayoutNode, target_path: &[String]) {
+    if let Some(node) = find_node_by_path(root, target_path) {
+        ctx.set_stroke_style_str("rgba(59, 130, 246, 0.9)");
+        ctx.set_line_width(2.5);
+        ctx.stroke_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
+    }
+}
+
+fn find_node_by_path<'a>(node: &'a LayoutNode, path: &[String]) -> Option<&'a LayoutNode> {
+    if path.is_empty() {
+        return Some(node);
+    }
+    for child in &node.children {
+        if child.name == path[0] {
+            return find_node_by_path(child, &path[1..]);
+        }
+    }
+    None
 }
 
 fn round_rect(ctx: &CanvasRenderingContext2d, x: f64, y: f64, w: f64, h: f64, r: f64) {
