@@ -414,12 +414,77 @@ fn render_comparison(dpr: f64) {
     });
 }
 
+fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
+    STATE.with(|s| {
+        let state = s.borrow();
+
+        let (hovered_root, other_root) = if is_canvas_b {
+            (&state.compare_layout, &state.layout_root)
+        } else {
+            (&state.layout_root, &state.compare_layout)
+        };
+
+        if let (Some(hovered), Some(other), Some(deltas)) =
+            (hovered_root, other_root, &state.diff_map)
+        {
+            let doc = window().unwrap().document().unwrap();
+            let dpr = state.dpr;
+
+            // Redraw both canvases clean (clears previous highlights)
+            let canvas_a: HtmlCanvasElement = doc.get_element_by_id("canvas").unwrap().unchecked_into();
+            let ctx_a = canvas_a.get_context("2d").unwrap().unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx_a.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
+            render::render_diff(&ctx_a, state.layout_root.as_ref().unwrap(), deltas);
+
+            let canvas_b: HtmlCanvasElement = doc.get_element_by_id("canvas-b").unwrap().unchecked_into();
+            let ctx_b = canvas_b.get_context("2d").unwrap().unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx_b.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
+            render::render_diff(&ctx_b, state.compare_layout.as_ref().unwrap(), deltas);
+
+            if let Some(path) = layout::hit_test(hovered, x, y) {
+                // Highlight matching node in OTHER canvas
+                let other_ctx = if is_canvas_b { &ctx_a } else { &ctx_b };
+                render::render_highlight(other_ctx, other, &path[1..]);
+
+                // Build full path string for delta lookup
+                let full_path = path[1..].join("/");
+
+                // Build comparison tooltip
+                let leaf_name = path.last().map(|s| s.as_str()).unwrap_or("");
+                let tooltip = if let Some(delta) = deltas.get(&full_path) {
+                    let before_str = delta.before.map(format_size).unwrap_or_else(|| "\u{2014}".into());
+                    let after_str = delta.after.map(format_size).unwrap_or_else(|| "\u{2014}".into());
+                    let diff = delta.diff_bytes();
+                    let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
+                    let diff_str = format!("{sign}{}", format_size(abs_diff));
+                    format!("{leaf_name}\n{before_str} \u{2192} {after_str}\n{diff_str}")
+                } else {
+                    leaf_name.to_string()
+                };
+
+                // Show tooltip on hovered canvas
+                let hovered_ctx = if is_canvas_b { &ctx_b } else { &ctx_a };
+                render::render_tooltip(hovered_ctx, x, y, &tooltip, state.canvas_width, state.canvas_height);
+            }
+        }
+    });
+}
+
 fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
     let canvas: HtmlCanvasElement = document.get_element_by_id("canvas").unwrap().unchecked_into();
 
     let cb = Closure::wrap(Box::new(move |e: MouseEvent| {
         let x = e.offset_x() as f64;
         let y = e.offset_y() as f64;
+
+        // Check if in comparison mode
+        let in_compare = STATE.with(|s| s.borrow().diff_map.is_some());
+        if in_compare {
+            handle_compare_hover(x, y, false);
+            return;
+        }
 
         STATE.with(|s| {
             let state = s.borrow();
@@ -470,6 +535,17 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
         });
     }) as Box<dyn FnMut(_)>);
     canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())?;
+    cb.forget();
+
+    // Canvas B mousemove (comparison mode)
+    let canvas_b: HtmlCanvasElement = document.get_element_by_id("canvas-b").unwrap().unchecked_into();
+    let cb = Closure::wrap(Box::new(move |e: MouseEvent| {
+        let in_compare = STATE.with(|s| s.borrow().diff_map.is_some());
+        if in_compare {
+            handle_compare_hover(e.offset_x() as f64, e.offset_y() as f64, true);
+        }
+    }) as Box<dyn FnMut(_)>);
+    canvas_b.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())?;
     cb.forget();
 
     Ok(())
