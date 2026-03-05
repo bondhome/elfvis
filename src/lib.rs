@@ -71,6 +71,11 @@ pub fn main() -> Result<(), JsValue> {
         STATE.with(|s| {
             let mut state = s.borrow_mut();
             state.layout_root = None;
+            state.size_tree = None;
+            state.compare_layout = None;
+            state.compare_filename = String::new();
+            state.compare_total_size = 0;
+            state.diff_map = None;
         });
 
         doc.get_element_by_id("header").unwrap()
@@ -84,10 +89,23 @@ pub fn main() -> Result<(), JsValue> {
             corner.unchecked_ref::<HtmlElement>().class_list().remove_1("hidden").ok();
         }
 
+        // Hide comparison UI
+        doc.get_element_by_id("canvas-b").unwrap()
+            .unchecked_ref::<HtmlElement>().style().set_property("display", "none").ok();
+        doc.get_element_by_id("compare-divider").unwrap()
+            .unchecked_ref::<HtmlElement>().style().set_property("display", "none").ok();
+        doc.get_element_by_id("canvas-container").unwrap()
+            .unchecked_ref::<HtmlElement>().class_list().remove_1("compare-mode").ok();
+
         let canvas: HtmlCanvasElement = doc.get_element_by_id("canvas").unwrap().unchecked_into();
         let ctx = canvas.get_context("2d").unwrap().unwrap()
             .unchecked_into::<CanvasRenderingContext2d>();
         ctx.clear_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
+
+        let canvas_b: HtmlCanvasElement = doc.get_element_by_id("canvas-b").unwrap().unchecked_into();
+        let ctx_b = canvas_b.get_context("2d").unwrap().unwrap()
+            .unchecked_into::<CanvasRenderingContext2d>();
+        ctx_b.clear_rect(0.0, 0.0, canvas_b.width() as f64, canvas_b.height() as f64);
     }) as Box<dyn FnMut(_)>);
     reset.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
     cb.forget();
