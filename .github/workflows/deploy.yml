@@ -25,7 +25,14 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        run: |
+          VERSION=0.13.1
+          EXPECTED_SHA256=c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539
+          ASSET="wasm-pack-v${VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSLO "https://github.com/rustwasm/wasm-pack/releases/download/v${VERSION}/${ASSET}.tar.gz"
+          echo "${EXPECTED_SHA256}  ${ASSET}.tar.gz" | sha256sum -c -
+          tar -xzf "${ASSET}.tar.gz"
+          sudo install -m 0755 "${ASSET}/wasm-pack" /usr/local/bin/wasm-pack
 
       - name: Build WASM
         run: wasm-pack build --target web --out-dir www/pkg --release
