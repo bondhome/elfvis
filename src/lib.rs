@@ -2,6 +2,8 @@ pub mod parse;
 pub mod tree;
 pub mod layout;
 pub mod color;
+pub mod diff;
+pub mod compare;
 mod render;
 
 use wasm_bindgen::prelude::*;
@@ -19,6 +21,13 @@ struct AppState {
     canvas_width: f64,
     canvas_height: f64,
     dpr: f64,
+    // Comparison mode
+    symbols: Option<Vec<parse::SymbolDetail>>,
+    compare_layout: Option<layout::LayoutNode>,
+    compare_filename: String,
+    compare_total_size: u64,
+    diff_map: Option<std::collections::HashMap<tree::SymbolKey, diff::Delta>>,
+    ambiguous: std::collections::HashSet<tree::SymbolKey>,
 }
 
 thread_local! {
@@ -29,6 +38,12 @@ thread_local! {
         canvas_width: 0.0,
         canvas_height: 0.0,
         dpr: 1.0,
+        symbols: None,
+        compare_layout: None,
+        compare_filename: String::new(),
+        compare_total_size: 0,
+        diff_map: None,
+        ambiguous: std::collections::HashSet::new(),
     });
 }
 
@@ -59,6 +74,12 @@ pub fn main() -> Result<(), JsValue> {
         STATE.with(|s| {
             let mut state = s.borrow_mut();
             state.layout_root = None;
+            state.symbols = None;
+            state.compare_layout = None;
+            state.compare_filename = String::new();
+            state.compare_total_size = 0;
+            state.diff_map = None;
+            state.ambiguous.clear();
         });
 
         doc.get_element_by_id("header").unwrap()
@@ -72,12 +93,49 @@ pub fn main() -> Result<(), JsValue> {
             corner.unchecked_ref::<HtmlElement>().class_list().remove_1("hidden").ok();
         }
 
+        // Hide comparison UI
+        doc.get_element_by_id("canvas-b").unwrap()
+            .unchecked_ref::<HtmlElement>().style().set_property("display", "none").ok();
+        doc.get_element_by_id("compare-divider").unwrap()
+            .unchecked_ref::<HtmlElement>().style().set_property("display", "none").ok();
+        doc.get_element_by_id("canvas-container").unwrap()
+            .unchecked_ref::<HtmlElement>().class_list().remove_1("compare-mode").ok();
+
         let canvas: HtmlCanvasElement = doc.get_element_by_id("canvas").unwrap().unchecked_into();
         let ctx = canvas.get_context("2d").unwrap().unwrap()
             .unchecked_into::<CanvasRenderingContext2d>();
         ctx.clear_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
+
+        let canvas_b: HtmlCanvasElement = doc.get_element_by_id("canvas-b").unwrap().unchecked_into();
+        let ctx_b = canvas_b.get_context("2d").unwrap().unwrap()
+            .unchecked_into::<CanvasRenderingContext2d>();
+        ctx_b.clear_rect(0.0, 0.0, canvas_b.width() as f64, canvas_b.height() as f64);
     }) as Box<dyn FnMut(_)>);
     reset.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+    cb.forget();
+
+    // Compare button
+    let compare_btn = document.get_element_by_id("compare-btn").unwrap();
+    let cb = Closure::wrap(Box::new(move |_: Event| {
+        let doc = window().unwrap().document().unwrap();
+        let input: HtmlInputElement = doc.get_element_by_id("file-input-b").unwrap().unchecked_into();
+        input.click();
+    }) as Box<dyn FnMut(_)>);
+    compare_btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+    cb.forget();
+
+    // Compare file input
+    let input_b: HtmlInputElement = document.get_element_by_id("file-input-b").unwrap().unchecked_into();
+    let cb = Closure::wrap(Box::new(move |_: Event| {
+        let doc = window().unwrap().document().unwrap();
+        let input: HtmlInputElement = doc.get_element_by_id("file-input-b").unwrap().unchecked_into();
+        if let Some(files) = input.files() {
+            if let Some(file) = files.get(0) {
+                load_compare_file(file);
+            }
+        }
+    }) as Box<dyn FnMut(_)>);
+    input_b.add_event_listener_with_callback("change", cb.as_ref().unchecked_ref())?;
     cb.forget();
 
     Ok(())
@@ -166,8 +224,16 @@ fn load_file(file: web_sys::File) {
 fn process_elf(filename: &str, data: &[u8]) {
     let document = window().unwrap().document().unwrap();
 
-    match parse::parse_elf(data) {
-        Ok(symbols) => {
+    match parse::parse_elf_detailed(data) {
+        Ok(details) => {
+            let symbols: Vec<parse::ResolvedSymbol> = details
+                .iter()
+                .map(|d| parse::ResolvedSymbol {
+                    name: d.name.clone(),
+                    size: d.size,
+                    source_path: d.display_path.clone(),
+                })
+                .collect();
             let size_tree = tree::build_tree(&symbols);
             let total_size = size_tree.size;
             let win = window().unwrap();
@@ -179,6 +245,7 @@ fn process_elf(filename: &str, data: &[u8]) {
 
             STATE.with(|s| {
                 let mut state = s.borrow_mut();
+                state.symbols = Some(details);
                 state.layout_root = Some(layout_root);
                 state.filename = filename.to_string();
                 state.total_size = total_size;
@@ -225,6 +292,10 @@ fn show_header(document: &Document, filename: &str, total_size: u64) {
     document.get_element_by_id("filename").unwrap().set_text_content(Some(filename));
     let size_str = format_size(total_size);
     document.get_element_by_id("totalsize").unwrap().set_text_content(Some(&format!("Flash: {size_str}")));
+
+    if let Some(btn) = document.get_element_by_id("compare-btn") {
+        btn.unchecked_ref::<HtmlElement>().style().set_property("display", "").ok();
+    }
 }
 
 fn show_error(document: &Document, msg: &str) {
@@ -243,12 +314,254 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// The percent change for a `before -> after` size comparison. A positive
+/// size appearing from a zero baseline is reported as `f64::INFINITY`
+/// ("new"), not `0.0` — dividing by a zero baseline is meaningless, and
+/// `0.0` reads as "no change" when the honest answer is "can't measure a
+/// percentage of nothing, but it did grow". Zero-to-zero is neutral (`0.0`).
+/// Callers that need a label rather than a raw value check `.is_finite()`.
+fn size_change_pct(before: u64, after: u64) -> f64 {
+    if before > 0 {
+        (after as i64 - before as i64) as f64 / before as f64 * 100.0
+    } else if after > 0 {
+        f64::INFINITY
+    } else {
+        0.0
+    }
+}
+
+fn load_compare_file(file: web_sys::File) {
+    let filename = file.name();
+    let reader = FileReader::new().unwrap();
+    let r = reader.clone();
+    let cb = Closure::wrap(Box::new(move |_: Event| {
+        let array_buffer = r.result().unwrap();
+        let uint8_array = js_sys::Uint8Array::new(&array_buffer);
+        let data = uint8_array.to_vec();
+        process_compare_elf(&filename, &data);
+    }) as Box<dyn FnMut(_)>);
+    reader.set_onload(Some(cb.as_ref().unchecked_ref()));
+    cb.forget();
+    reader.read_as_array_buffer(&file).unwrap();
+}
+
+fn process_compare_elf(filename: &str, data: &[u8]) {
+    let document = window().unwrap().document().unwrap();
+
+    match parse::parse_elf_detailed(data) {
+        Ok(symbols_b) => {
+            let win = window().unwrap();
+            let full_w = win.inner_width().unwrap().as_f64().unwrap();
+            let h = win.inner_height().unwrap().as_f64().unwrap() - 36.0;
+            let half_w = (full_w - 2.0) / 2.0;
+            let dpr = win.device_pixel_ratio();
+
+            STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                // Identity, normalization and both display trees come from one
+                // pure pass over the pair — see `compare::compare`.
+                let cmp = compare::compare(state.symbols.as_deref().unwrap_or(&[]), &symbols_b);
+
+                state.layout_root = Some(layout::layout(&cmp.tree_a, half_w, h));
+                state.compare_layout = Some(layout::layout(&cmp.tree_b, half_w, h));
+                state.compare_filename = filename.to_string();
+                state.compare_total_size = cmp.tree_b.size;
+                state.diff_map = Some(cmp.deltas);
+                state.ambiguous = cmp.ambiguous;
+                state.canvas_width = half_w;
+                state.canvas_height = h;
+                state.dpr = dpr;
+            });
+            let total_b = STATE.with(|s| s.borrow().compare_total_size);
+
+            // Update header
+            STATE.with(|s| {
+                let state = s.borrow();
+                let size_a = format_size(state.total_size);
+                let size_b = format_size(total_b);
+                let diff = total_b as i64 - state.total_size as i64;
+                let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
+                let diff_str = format!("{sign}{}", format_size(abs_diff));
+                // An empty baseline (0 -> N bytes) is a "new" file, not "+0.0%"
+                // growth — see `size_change_pct()`.
+                let pct = size_change_pct(state.total_size, total_b);
+                let pct_str = if pct.is_finite() {
+                    format!("{pct:+.1}%")
+                } else {
+                    "new".to_string()
+                };
+                document.get_element_by_id("filename").unwrap()
+                    .set_text_content(Some(&format!("{} vs {}", state.filename, filename)));
+                document.get_element_by_id("totalsize").unwrap()
+                    .set_text_content(Some(&format!("{size_a} → {size_b} ({diff_str}, {pct_str})")));
+            });
+
+            // Hide compare button
+            if let Some(btn) = document.get_element_by_id("compare-btn") {
+                btn.unchecked_ref::<HtmlElement>().style().set_property("display", "none").ok();
+            }
+
+            // Show comparison UI
+            document.get_element_by_id("compare-divider").unwrap()
+                .unchecked_ref::<HtmlElement>().style().set_property("display", "").ok();
+            let canvas_b: HtmlCanvasElement = document.get_element_by_id("canvas-b").unwrap().unchecked_into();
+            canvas_b.style().set_property("display", "").ok();
+            document.get_element_by_id("canvas-container").unwrap()
+                .unchecked_ref::<HtmlElement>().class_list().add_1("compare-mode").ok();
+
+            // Resize canvas A
+            let canvas_a: HtmlCanvasElement = document.get_element_by_id("canvas").unwrap().unchecked_into();
+            canvas_a.set_width((half_w * dpr) as u32);
+            canvas_a.set_height((h * dpr) as u32);
+            canvas_a.style().set_property("width", &format!("{half_w}px")).ok();
+            canvas_a.style().set_property("height", &format!("{h}px")).ok();
+
+            // Set up canvas B
+            canvas_b.set_width((half_w * dpr) as u32);
+            canvas_b.set_height((h * dpr) as u32);
+            canvas_b.style().set_property("width", &format!("{half_w}px")).ok();
+            canvas_b.style().set_property("height", &format!("{h}px")).ok();
+
+            // Render both
+            render_comparison(dpr);
+        }
+        Err(msg) => {
+            show_error(&document, &msg);
+        }
+    }
+}
+
+fn render_comparison(dpr: f64) {
+    let document = window().unwrap().document().unwrap();
+
+    STATE.with(|s| {
+        let state = s.borrow();
+        if let (Some(ref root_a), Some(ref root_b), Some(ref deltas)) =
+            (&state.layout_root, &state.compare_layout, &state.diff_map)
+        {
+            let canvas_a: HtmlCanvasElement = document.get_element_by_id("canvas").unwrap().unchecked_into();
+            let ctx_a = canvas_a.get_context("2d").unwrap().unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx_a.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
+            render::render_diff(&ctx_a, root_a, deltas, &state.ambiguous);
+
+            let canvas_b: HtmlCanvasElement = document.get_element_by_id("canvas-b").unwrap().unchecked_into();
+            let ctx_b = canvas_b.get_context("2d").unwrap().unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx_b.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
+            render::render_diff(&ctx_b, root_b, deltas, &state.ambiguous);
+        }
+    });
+}
+
+fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
+    STATE.with(|s| {
+        let state = s.borrow();
+
+        let (hovered_root, other_root) = if is_canvas_b {
+            (&state.compare_layout, &state.layout_root)
+        } else {
+            (&state.layout_root, &state.compare_layout)
+        };
+
+        if let (Some(hovered), Some(other), Some(deltas)) =
+            (hovered_root, other_root, &state.diff_map)
+        {
+            let doc = window().unwrap().document().unwrap();
+            let dpr = state.dpr;
+
+            // Redraw both canvases clean (clears previous highlights)
+            let canvas_a: HtmlCanvasElement = doc.get_element_by_id("canvas").unwrap().unchecked_into();
+            let ctx_a = canvas_a.get_context("2d").unwrap().unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx_a.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
+            render::render_diff(&ctx_a, state.layout_root.as_ref().unwrap(), deltas, &state.ambiguous);
+
+            let canvas_b: HtmlCanvasElement = doc.get_element_by_id("canvas-b").unwrap().unchecked_into();
+            let ctx_b = canvas_b.get_context("2d").unwrap().unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx_b.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
+            render::render_diff(&ctx_b, state.compare_layout.as_ref().unwrap(), deltas, &state.ambiguous);
+
+            if let Some(chain) = layout::hit_test(hovered, x, y) {
+                // The node under the cursor, as returned by the hit test. It
+                // must not be re-found by name: same-named sibling leaves are
+                // legitimate (two locals named `helper` under one header).
+                let node = *chain.last().unwrap();
+
+                // What the hovered box stands for: one exact symbol for a leaf,
+                // a logical group (directory / unresolved cluster) otherwise.
+                // Both cross-highlighting and the parent total are defined by
+                // membership in that, evaluated over the whole comparison —
+                // not over whatever leaves the hovered tree happens to hold.
+                let other_ctx = if is_canvas_b { &ctx_a } else { &ctx_b };
+                if node.is_leaf {
+                    if let Some(key) = &node.key {
+                        render::render_highlight(other_ctx, other, &|k| k == key);
+                    }
+                } else if let Some(group) = &node.group {
+                    render::render_highlight(other_ctx, other, &|k| group.contains(k));
+                }
+
+                let display_name = node.name.as_str();
+                let tooltip = if node.is_leaf {
+                    if let Some(delta) = node.key.as_ref().and_then(|k| deltas.get(k)) {
+                        let before_str = delta.before.map(format_size).unwrap_or_else(|| "\u{2014}".into());
+                        let after_str = delta.after.map(format_size).unwrap_or_else(|| "\u{2014}".into());
+                        let diff = delta.diff_bytes();
+                        let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
+                        let diff_str = format!("{sign}{}", format_size(abs_diff));
+                        if node.key.as_ref().is_some_and(|k| state.ambiguous.contains(k)) {
+                            format!(
+                                "{display_name}\nambiguous: several same-named symbols\ncombined {before_str} \u{2192} {after_str} ({diff_str})"
+                            )
+                        } else {
+                            format!("{display_name}\n{before_str} \u{2192} {after_str}\n{diff_str}")
+                        }
+                    } else {
+                        display_name.to_string()
+                    }
+                } else if let Some(group) = &node.group {
+                    let (total_before, total_after) = diff::aggregate_group(deltas, group);
+                    let diff = total_after as i64 - total_before as i64;
+                    let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
+                    let diff_str = format!("{sign}{}", format_size(abs_diff));
+                    let pct = size_change_pct(total_before, total_after);
+                    let pct_str = if pct.is_finite() {
+                        format!(" ({pct:+.1}%)")
+                    } else {
+                        " (new)".to_string()
+                    };
+                    format!(
+                        "{display_name}\n{} \u{2192} {}\n{diff_str}{pct_str}",
+                        format_size(total_before),
+                        format_size(total_after),
+                    )
+                } else {
+                    display_name.to_string()
+                };
+
+                // Show tooltip on hovered canvas
+                let hovered_ctx = if is_canvas_b { &ctx_b } else { &ctx_a };
+                render::render_tooltip(hovered_ctx, x, y, &tooltip, state.canvas_width, state.canvas_height);
+            }
+        }
+    });
+}
+
 fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
     let canvas: HtmlCanvasElement = document.get_element_by_id("canvas").unwrap().unchecked_into();
 
     let cb = Closure::wrap(Box::new(move |e: MouseEvent| {
         let x = e.offset_x() as f64;
         let y = e.offset_y() as f64;
+
+        // Check if in comparison mode
+        let in_compare = STATE.with(|s| s.borrow().diff_map.is_some());
+        if in_compare {
+            handle_compare_hover(x, y, false);
+            return;
+        }
 
         STATE.with(|s| {
             let state = s.borrow();
@@ -262,15 +575,8 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
                 ctx.set_transform(state.dpr, 0.0, 0.0, state.dpr, 0.0, 0.0).ok();
                 render::render(&ctx, root);
 
-                if let Some(path) = layout::hit_test(root, x, y) {
-                    let mut node = root;
-                    for name in &path[1..] {
-                        if let Some(child) = node.children.iter().find(|c| c.name == *name) {
-                            node = child;
-                        } else {
-                            break;
-                        }
-                    }
+                if let Some(chain) = layout::hit_test(root, x, y) {
+                    let node = *chain.last().unwrap();
 
                     let pct = if state.total_size > 0 {
                         node.size as f64 / state.total_size as f64 * 100.0
@@ -281,12 +587,12 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
 
                     // Show "filename\nsymbol  size (pct%)"
                     // The path is [root, ..dirs.., file, symbol] for leaves
-                    let parts = &path[1..];
+                    let parts: Vec<&str> = chain[1..].iter().map(|n| n.name.as_str()).collect();
                     let tooltip = if parts.len() >= 2 {
-                        let file_node = &parts[parts.len() - 2];
+                        let file_node = parts[parts.len() - 2];
                         // basename: last component after any '/' from collapsed paths
                         let basename = file_node.rsplit('/').next().unwrap_or(file_node);
-                        let sym_name = &parts[parts.len() - 1];
+                        let sym_name = parts[parts.len() - 1];
                         format!("{basename}\n{sym_name}\n{size_str} ({pct:.1}%)")
                     } else {
                         let display_path = parts.join("/");
@@ -301,5 +607,43 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
     canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())?;
     cb.forget();
 
+    // Canvas B mousemove (comparison mode)
+    let canvas_b: HtmlCanvasElement = document.get_element_by_id("canvas-b").unwrap().unchecked_into();
+    let cb = Closure::wrap(Box::new(move |e: MouseEvent| {
+        let in_compare = STATE.with(|s| s.borrow().diff_map.is_some());
+        if in_compare {
+            handle_compare_hover(e.offset_x() as f64, e.offset_y() as f64, true);
+        }
+    }) as Box<dyn FnMut(_)>);
+    canvas_b.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())?;
+    cb.forget();
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_size_change_pct_empty_baseline_is_infinite() {
+        // Regression for the code-review finding: comparing an empty baseline
+        // against a nonempty file must not report "+0.0%" growth.
+        assert_eq!(size_change_pct(0, 384), f64::INFINITY);
+    }
+
+    #[test]
+    fn test_size_change_pct_both_empty_is_neutral() {
+        assert_eq!(size_change_pct(0, 0), 0.0);
+    }
+
+    #[test]
+    fn test_size_change_pct_ordinary_growth() {
+        assert!((size_change_pct(100, 150) - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_size_change_pct_ordinary_shrinkage() {
+        assert!((size_change_pct(100, 50) - (-50.0)).abs() < 0.01);
+    }
 }

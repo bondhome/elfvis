@@ -1,7 +1,14 @@
+use std::collections::{HashMap, HashSet};
+
 use web_sys::CanvasRenderingContext2d;
 
-use crate::color::pastel_color;
+use crate::color::{delta_color, pastel_color};
+use crate::diff::Delta;
 use crate::layout::{LayoutNode, HEADER_HEIGHT, MIN_HEADER_HEIGHT};
+use crate::tree::SymbolKey;
+
+const MONO_FONT_STACK: &str =
+    "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
 
 pub fn render(ctx: &CanvasRenderingContext2d, root: &LayoutNode) {
     ctx.set_fill_style_str("#ffffff");
@@ -32,48 +39,7 @@ fn render_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode) {
             ctx.set_fill_style_str(&header_color.to_css());
             ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, HEADER_HEIGHT);
 
-            let pad = 4.0;
-            let max_w = node.rect.w - pad * 2.0;
-            let y_mid = node.rect.y + HEADER_HEIGHT / 2.0;
-            let mono = "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
-            let font_full = format!("bold 11px {mono}");
-            let font_small = format!("bold 9px {mono}");
-            let font_ellipsis = format!("bold 6px {mono}");
-
-            ctx.set_fill_style_str("#333333");
-            ctx.set_text_baseline("middle");
-
-            // Try 11px first
-            ctx.set_font(&font_full);
-            let fits_full = ctx.measure_text(&node.name).map(|m| m.width() <= max_w).unwrap_or(false);
-
-            if fits_full {
-                ctx.fill_text(&node.name, node.rect.x + pad, y_mid).ok();
-            } else {
-                let name = strip_extension(&node.name);
-                // Try 9px full
-                ctx.set_font(&font_small);
-                let fits_small = ctx.measure_text(&name).map(|m| m.width() <= max_w).unwrap_or(false);
-
-                if fits_small {
-                    ctx.fill_text(&name, node.rect.x + pad, y_mid).ok();
-                } else {
-                    // Ellipsis + tail at 9px
-                    let ellipsis = "\u{2026}";
-                    ctx.set_font(&font_ellipsis);
-                    let ellipsis_w = ctx.measure_text(ellipsis).map(|m| m.width()).unwrap_or(4.0);
-                    ctx.fill_text(ellipsis, node.rect.x + pad, y_mid).ok();
-
-                    let tail_budget = max_w - ellipsis_w;
-                    if tail_budget > 0.0 {
-                        ctx.set_font(&font_small);
-                        let tail = fit_tail(ctx, &name, tail_budget);
-                        if !tail.is_empty() {
-                            ctx.fill_text(&tail, node.rect.x + pad + ellipsis_w, y_mid).ok();
-                        }
-                    }
-                }
-            }
+            draw_header_label(ctx, &node.name, node.rect.x, node.rect.w, node.rect.y);
         }
 
         for child in &node.children {
@@ -97,9 +63,8 @@ fn render_label(ctx: &CanvasRenderingContext2d, node: &LayoutNode) {
     let max_w = node.rect.w - pad * 2.0;
     let y_mid = node.rect.y + node.rect.h / 2.0;
 
-    let mono = "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
-    let font_main = format!("7px {mono}");
-    let font_ellipsis = format!("5px {mono}");
+    let font_main = format!("7px {MONO_FONT_STACK}");
+    let font_ellipsis = format!("5px {MONO_FONT_STACK}");
 
     ctx.set_fill_style_str("#333333");
     ctx.set_font(&font_main);
@@ -162,6 +127,112 @@ pub fn render_tooltip(ctx: &CanvasRenderingContext2d, x: f64, y: f64, text: &str
     }
 }
 
+/// Render a treemap with delta-based coloring for comparison mode.
+pub fn render_diff(
+    ctx: &CanvasRenderingContext2d,
+    root: &LayoutNode,
+    deltas: &HashMap<SymbolKey, Delta>,
+    ambiguous: &HashSet<SymbolKey>,
+) {
+    ctx.set_fill_style_str("#ffffff");
+    ctx.fill_rect(root.rect.x, root.rect.y, root.rect.w, root.rect.h);
+    render_diff_node(ctx, root, deltas, ambiguous);
+}
+
+/// Fill for a leaf whose identity is shared by several symbols: a per-symbol
+/// change can't be established, so it gets no red/green claim.
+const AMBIGUOUS_FILL: &str = "rgb(200,200,200)";
+
+fn render_diff_node(
+    ctx: &CanvasRenderingContext2d,
+    node: &LayoutNode,
+    deltas: &HashMap<SymbolKey, Delta>,
+    ambiguous: &HashSet<SymbolKey>,
+) {
+    if node.rect.w < 1.0 || node.rect.h < 1.0 {
+        return;
+    }
+
+    if node.is_leaf {
+        // Look up by stable symbol key (source + name), not bare name — two
+        // translation units may legitimately define a same-named local symbol.
+        if node.key.as_ref().is_some_and(|k| ambiguous.contains(k)) {
+            ctx.set_fill_style_str(AMBIGUOUS_FILL);
+        } else {
+            let color = if let Some(delta) = node.key.as_ref().and_then(|k| deltas.get(k)) {
+                delta_color(delta.diff_pct())
+            } else {
+                delta_color(0.0)
+            };
+            ctx.set_fill_style_str(&color.to_css());
+        }
+        ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
+
+        ctx.set_stroke_style_str("rgba(0,0,0,1)");
+        ctx.set_line_width(0.5);
+        ctx.stroke_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
+
+        render_label(ctx, node);
+    } else {
+        let show_header = node.rect.h >= MIN_HEADER_HEIGHT && node.depth > 0;
+        if show_header {
+            ctx.set_fill_style_str("rgb(220,220,220)");
+            ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, HEADER_HEIGHT);
+
+            draw_header_label(ctx, &node.name, node.rect.x, node.rect.w, node.rect.y);
+        }
+
+        for child in &node.children {
+            render_diff_node(ctx, child, deltas, ambiguous);
+        }
+
+        if node.depth > 0 {
+            ctx.set_stroke_style_str("rgba(0,0,0,1)");
+            ctx.set_line_width(1.0);
+            ctx.stroke_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
+        }
+    }
+}
+
+/// Highlight every leaf in `root` whose stable symbol key satisfies `wanted`.
+pub fn render_highlight(ctx: &CanvasRenderingContext2d, root: &LayoutNode, wanted: &dyn Fn(&SymbolKey) -> bool) {
+    for leaf in matching_leaves(root, wanted) {
+        ctx.set_stroke_style_str("rgba(59, 130, 246, 0.9)");
+        ctx.set_line_width(2.5);
+        ctx.stroke_rect(leaf.rect.x, leaf.rect.y, leaf.rect.w, leaf.rect.h);
+    }
+}
+
+/// Every leaf under `node` whose stable symbol key satisfies `wanted` — the
+/// selection half of cross-highlighting, kept canvas-free so it can be unit
+/// tested. Matches by identity, not display path: the two comparison trees
+/// are built and clustered independently, so the same symbol can end up at a
+/// different collapsed directory path in each one. The predicate is either
+/// "is this exact key" (hovering a leaf) or `Group::contains` (hovering a
+/// directory), so a whole group is highlighted even where the other tree
+/// arranges those symbols differently.
+fn matching_leaves<'a>(node: &'a LayoutNode, wanted: &dyn Fn(&SymbolKey) -> bool) -> Vec<&'a LayoutNode> {
+    let mut matches = Vec::new();
+    collect_matching_leaves(node, wanted, &mut matches);
+    matches
+}
+
+fn collect_matching_leaves<'a>(
+    node: &'a LayoutNode,
+    wanted: &dyn Fn(&SymbolKey) -> bool,
+    matches: &mut Vec<&'a LayoutNode>,
+) {
+    if node.is_leaf {
+        if node.key.as_ref().is_some_and(wanted) {
+            matches.push(node);
+        }
+        return;
+    }
+    for child in &node.children {
+        collect_matching_leaves(child, wanted, matches);
+    }
+}
+
 fn round_rect(ctx: &CanvasRenderingContext2d, x: f64, y: f64, w: f64, h: f64, r: f64) {
     ctx.move_to(x + r, y);
     ctx.line_to(x + w - r, y);
@@ -173,6 +244,52 @@ fn round_rect(ctx: &CanvasRenderingContext2d, x: f64, y: f64, w: f64, h: f64, r:
     ctx.line_to(x, y + r);
     ctx.arc_to(x, y, x + r, y, r).ok();
     ctx.close_path();
+}
+
+/// Draw a directory/file header label within `[x, x+w]`, falling back through a full
+/// name, an extension-stripped name at a smaller size, then an ellipsis + best-fit
+/// tail. Shared by the single-file view and comparison-mode panels so a header never
+/// silently renders blank just because its panel is narrower, and so the header text
+/// matches the node's real name (as shown in tooltips) whenever it fits.
+fn draw_header_label(ctx: &CanvasRenderingContext2d, name: &str, x: f64, w: f64, y: f64) {
+    let pad = 4.0;
+    let max_w = w - pad * 2.0;
+    let y_mid = y + HEADER_HEIGHT / 2.0;
+    let font_full = format!("bold 11px {MONO_FONT_STACK}");
+    let font_small = format!("bold 9px {MONO_FONT_STACK}");
+    let font_ellipsis = format!("bold 6px {MONO_FONT_STACK}");
+
+    ctx.set_fill_style_str("#333333");
+    ctx.set_text_baseline("middle");
+
+    ctx.set_font(&font_full);
+    let fits_full = ctx.measure_text(name).map(|m| m.width() <= max_w).unwrap_or(false);
+    if fits_full {
+        ctx.fill_text(name, x + pad, y_mid).ok();
+        return;
+    }
+
+    let stripped = strip_extension(name);
+    ctx.set_font(&font_small);
+    let fits_small = ctx.measure_text(&stripped).map(|m| m.width() <= max_w).unwrap_or(false);
+    if fits_small {
+        ctx.fill_text(&stripped, x + pad, y_mid).ok();
+        return;
+    }
+
+    let ellipsis = "\u{2026}";
+    ctx.set_font(&font_ellipsis);
+    let ellipsis_w = ctx.measure_text(ellipsis).map(|m| m.width()).unwrap_or(4.0);
+    ctx.fill_text(ellipsis, x + pad, y_mid).ok();
+
+    let tail_budget = max_w - ellipsis_w;
+    if tail_budget > 0.0 {
+        ctx.set_font(&font_small);
+        let tail = fit_tail(ctx, &stripped, tail_budget);
+        if !tail.is_empty() {
+            ctx.fill_text(&tail, x + pad + ellipsis_w, y_mid).ok();
+        }
+    }
 }
 
 /// Strip file extension (e.g. ".c", ".h", ".rs") if present.
@@ -249,5 +366,93 @@ fn darken(c: &crate::color::Color, amount: f64) -> crate::color::Color {
         r: (c.r as f64 * (1.0 - amount)) as u8,
         g: (c.g as f64 * (1.0 - amount)) as u8,
         b: (c.b as f64 * (1.0 - amount)) as u8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Rect;
+    use crate::tree::Group;
+
+    fn leaf(x: f64, name: &str, key: Option<SymbolKey>) -> LayoutNode {
+        LayoutNode {
+            rect: Rect { x, y: 0.0, w: 10.0, h: 10.0 },
+            name: name.to_string(),
+            size: 10,
+            depth: 1,
+            is_leaf: true,
+            hue: 0.0,
+            children: Vec::new(),
+            key,
+            group: None,
+        }
+    }
+
+    fn dir(x: f64, name: &str, children: Vec<LayoutNode>) -> LayoutNode {
+        LayoutNode {
+            rect: Rect { x, y: 0.0, w: 20.0, h: 10.0 },
+            name: name.to_string(),
+            size: 10,
+            depth: 0,
+            is_leaf: false,
+            hue: 0.0,
+            children,
+            key: None,
+            group: None,
+        }
+    }
+
+    fn key(source: &str, name: &str) -> SymbolKey {
+        SymbolKey { source: Some(source.to_string()), name: name.to_string(), tu: None }
+    }
+
+    #[test]
+    fn test_matching_leaves_finds_leaf_despite_different_display_path() {
+        // The two comparison trees collapse directories independently, so the
+        // same symbol can sit at a different display path in each. Matching by
+        // SymbolKey must not care.
+        let keep_key = key("src/a.c", "keep");
+        let collapsed = dir(0.0, "a.c", vec![leaf(0.0, "keep", Some(keep_key.clone()))]);
+        let uncollapsed = dir(
+            0.0,
+            "src",
+            vec![
+                dir(0.0, "a.c", vec![leaf(0.0, "keep", Some(keep_key.clone()))]),
+                dir(20.0, "b.c", vec![leaf(20.0, "extra", Some(key("src/b.c", "extra")))]),
+            ],
+        );
+
+        let is_keep = |k: &SymbolKey| *k == keep_key;
+        assert_eq!(matching_leaves(&collapsed, &is_keep).len(), 1);
+        let found = matching_leaves(&uncollapsed, &is_keep);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "keep");
+    }
+
+    #[test]
+    fn test_matching_leaves_by_group_covers_members_the_hovered_tree_lacks() {
+        // Hovering directory `src` in one tree highlights every `src` member in
+        // the *other* tree, including files that exist only there.
+        let group = Group::Dir(vec!["src".into()]);
+        let other = dir(
+            0.0,
+            "root",
+            vec![
+                leaf(0.0, "keep", Some(key("src/a.c", "keep"))),
+                leaf(10.0, "added", Some(key("src/c.c", "added"))),
+                leaf(20.0, "elsewhere", Some(key("lib/x.c", "elsewhere"))),
+            ],
+        );
+        let found = matching_leaves(&other, &|k| group.contains(k));
+        let mut names: Vec<_> = found.iter().map(|l| l.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["added", "keep"]);
+    }
+
+    #[test]
+    fn test_matching_leaves_nothing_wanted_matches_nothing() {
+        let tree = leaf(0.0, "solo", Some(key("src/a.c", "solo")));
+        assert!(matching_leaves(&tree, &|_| false).is_empty());
     }
 }
