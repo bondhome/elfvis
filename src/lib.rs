@@ -22,11 +22,11 @@ struct AppState {
     dpr: f64,
     // Comparison mode
     size_tree: Option<tree::SizeNode>,
-    symbol_sizes: Option<std::collections::HashMap<String, u64>>,
+    symbol_sizes: Option<std::collections::HashMap<tree::SymbolKey, u64>>,
     compare_layout: Option<layout::LayoutNode>,
     compare_filename: String,
     compare_total_size: u64,
-    diff_map: Option<std::collections::HashMap<String, diff::Delta>>,
+    diff_map: Option<std::collections::HashMap<tree::SymbolKey, diff::Delta>>,
 }
 
 thread_local! {
@@ -307,24 +307,43 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn collect_leaf_names(node: &layout::LayoutNode) -> Vec<String> {
-    let mut names = Vec::new();
-    collect_leaf_names_recursive(node, &mut names);
-    names
+/// The percent change for a `before -> after` size comparison. A positive
+/// size appearing from a zero baseline is reported as `f64::INFINITY`
+/// ("new"), not `0.0` — dividing by a zero baseline is meaningless, and
+/// `0.0` reads as "no change" when the honest answer is "can't measure a
+/// percentage of nothing, but it did grow". Zero-to-zero is neutral (`0.0`).
+/// Callers that need a label rather than a raw value check `.is_finite()`.
+fn size_change_pct(before: u64, after: u64) -> f64 {
+    if before > 0 {
+        (after as i64 - before as i64) as f64 / before as f64 * 100.0
+    } else if after > 0 {
+        f64::INFINITY
+    } else {
+        0.0
+    }
 }
 
-fn collect_leaf_names_recursive(node: &layout::LayoutNode, names: &mut Vec<String>) {
+/// Collect the stable keys of every leaf (symbol) under `node`.
+fn collect_leaf_keys(node: &layout::LayoutNode) -> std::collections::HashSet<tree::SymbolKey> {
+    let mut keys = std::collections::HashSet::new();
+    collect_leaf_keys_recursive(node, &mut keys);
+    keys
+}
+
+fn collect_leaf_keys_recursive(node: &layout::LayoutNode, keys: &mut std::collections::HashSet<tree::SymbolKey>) {
     if node.is_leaf {
-        names.push(node.name.clone());
+        if let Some(k) = &node.key {
+            keys.insert(k.clone());
+        }
     } else {
         for child in &node.children {
-            collect_leaf_names_recursive(child, names);
+            collect_leaf_keys_recursive(child, keys);
         }
     }
 }
 
-fn symbols_to_map(symbols: &[parse::ResolvedSymbol]) -> std::collections::HashMap<String, u64> {
-    symbols.iter().map(|s| (s.name.clone(), s.size)).collect()
+fn symbols_to_map(symbols: &[parse::ResolvedSymbol]) -> std::collections::HashMap<tree::SymbolKey, u64> {
+    symbols.iter().map(|s| (tree::symbol_key(s), s.size)).collect()
 }
 
 fn load_compare_file(file: web_sys::File) {
@@ -388,15 +407,18 @@ fn process_compare_elf(filename: &str, data: &[u8]) {
                 let diff = total_b as i64 - state.total_size as i64;
                 let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
                 let diff_str = format!("{sign}{}", format_size(abs_diff));
-                let pct = if state.total_size > 0 {
-                    diff as f64 / state.total_size as f64 * 100.0
+                // An empty baseline (0 -> N bytes) is a "new" file, not "+0.0%"
+                // growth — see `size_change_pct()`.
+                let pct = size_change_pct(state.total_size, total_b);
+                let pct_str = if pct.is_finite() {
+                    format!("{pct:+.1}%")
                 } else {
-                    0.0
+                    "new".to_string()
                 };
                 document.get_element_by_id("filename").unwrap()
                     .set_text_content(Some(&format!("{} vs {}", state.filename, filename)));
                 document.get_element_by_id("totalsize").unwrap()
-                    .set_text_content(Some(&format!("{size_a} → {size_b} ({diff_str}, {pct:+.1}%)")));
+                    .set_text_content(Some(&format!("{size_a} → {size_b} ({diff_str}, {pct_str})")));
             });
 
             // Hide compare button
@@ -487,11 +509,9 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
             render::render_diff(&ctx_b, state.compare_layout.as_ref().unwrap(), deltas);
 
             if let Some(path) = layout::hit_test(hovered, x, y) {
-                // Highlight matching node in OTHER canvas
-                let other_ctx = if is_canvas_b { &ctx_a } else { &ctx_b };
-                render::render_highlight(other_ctx, other, &path[1..]);
-
-                // Walk to hovered node
+                // Walk to hovered node (within the hovered tree's own display
+                // path — safe here, unlike cross-tree matching, since we're
+                // walking the same tree hit_test just matched against).
                 let mut node = hovered;
                 for name in &path[1..] {
                     if let Some(child) = node.children.iter().find(|c| c.name == *name) {
@@ -501,10 +521,24 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
                     }
                 }
 
+                // The set of stable symbol keys this hovered box represents —
+                // one key for a leaf, every descendant leaf's key for a
+                // directory. Drives both cross-highlighting (by identity, not
+                // by display path, so it still finds the match when the two
+                // trees collapse differently) and, for directories, which
+                // delta-map entries belong to this logical group.
+                let group_keys: std::collections::HashSet<tree::SymbolKey> = if node.is_leaf {
+                    node.key.iter().cloned().collect()
+                } else {
+                    collect_leaf_keys(node)
+                };
+
+                let other_ctx = if is_canvas_b { &ctx_a } else { &ctx_b };
+                render::render_highlight(other_ctx, other, &group_keys);
+
                 let display_name = path.last().map(|s| s.as_str()).unwrap_or("");
                 let tooltip = if node.is_leaf {
-                    // Leaf: look up by symbol name
-                    if let Some(delta) = deltas.get(display_name) {
+                    if let Some(delta) = node.key.as_ref().and_then(|k| deltas.get(k)) {
                         let before_str = delta.before.map(format_size).unwrap_or_else(|| "\u{2014}".into());
                         let after_str = delta.after.map(format_size).unwrap_or_else(|| "\u{2014}".into());
                         let diff = delta.diff_bytes();
@@ -515,26 +549,20 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
                         display_name.to_string()
                     }
                 } else {
-                    // Parent: sum diffs of all descendant leaves
-                    let leaf_names = collect_leaf_names(node);
-                    let mut total_before: u64 = 0;
-                    let mut total_after: u64 = 0;
-                    for name in &leaf_names {
-                        if let Some(delta) = deltas.get(name.as_str()) {
-                            total_before += delta.before.unwrap_or(0);
-                            total_after += delta.after.unwrap_or(0);
-                        }
-                    }
+                    // Parent: sum before/after over every delta-map entry whose
+                    // *source* belongs to this group — not just the leaves
+                    // present in the hovered tree's own subtree. A symbol only
+                    // added in the other file has no leaf here to enumerate,
+                    // and one only removed has no leaf in the other tree, so
+                    // restricting the sum to one side's own traversal silently
+                    // dropped exactly the additions/removals that matter.
+                    let group_sources: std::collections::HashSet<&str> =
+                        group_keys.iter().map(|k| k.source.as_str()).collect();
+                    let (total_before, total_after) = diff::aggregate_by_source(deltas, &group_sources);
                     let diff = total_after as i64 - total_before as i64;
                     let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
                     let diff_str = format!("{sign}{}", format_size(abs_diff));
-                    let pct = if total_before > 0 {
-                        diff as f64 / total_before as f64 * 100.0
-                    } else if total_after > 0 {
-                        f64::INFINITY
-                    } else {
-                        0.0
-                    };
+                    let pct = size_change_pct(total_before, total_after);
                     let pct_str = if pct.is_finite() {
                         format!(" ({pct:+.1}%)")
                     } else {
@@ -632,4 +660,31 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
     cb.forget();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_size_change_pct_empty_baseline_is_infinite() {
+        // Regression for the code-review finding: comparing an empty baseline
+        // against a nonempty file must not report "+0.0%" growth.
+        assert_eq!(size_change_pct(0, 384), f64::INFINITY);
+    }
+
+    #[test]
+    fn test_size_change_pct_both_empty_is_neutral() {
+        assert_eq!(size_change_pct(0, 0), 0.0);
+    }
+
+    #[test]
+    fn test_size_change_pct_ordinary_growth() {
+        assert!((size_change_pct(100, 150) - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_size_change_pct_ordinary_shrinkage() {
+        assert!((size_change_pct(100, 50) - (-50.0)).abs() < 0.01);
+    }
 }

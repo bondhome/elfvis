@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use web_sys::CanvasRenderingContext2d;
 
 use crate::color::{delta_color, pastel_color};
 use crate::diff::Delta;
 use crate::layout::{LayoutNode, HEADER_HEIGHT, MIN_HEADER_HEIGHT};
+use crate::tree::SymbolKey;
 
 const MONO_FONT_STACK: &str =
     "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
@@ -130,22 +131,22 @@ pub fn render_tooltip(ctx: &CanvasRenderingContext2d, x: f64, y: f64, text: &str
 pub fn render_diff(
     ctx: &CanvasRenderingContext2d,
     root: &LayoutNode,
-    deltas: &HashMap<String, Delta>,
+    deltas: &HashMap<SymbolKey, Delta>,
 ) {
     ctx.set_fill_style_str("#ffffff");
     ctx.fill_rect(root.rect.x, root.rect.y, root.rect.w, root.rect.h);
     render_diff_node(ctx, root, deltas);
 }
 
-fn render_diff_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, deltas: &HashMap<String, Delta>) {
+fn render_diff_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, deltas: &HashMap<SymbolKey, Delta>) {
     if node.rect.w < 1.0 || node.rect.h < 1.0 {
         return;
     }
 
     if node.is_leaf {
-        // Look up by leaf name (symbol name) — not full tree path,
-        // since independent tree builds produce different clustering paths.
-        let color = if let Some(delta) = deltas.get(&node.name) {
+        // Look up by stable symbol key (source + name), not bare name — two
+        // translation units may legitimately define a same-named local symbol.
+        let color = if let Some(delta) = node.key.as_ref().and_then(|k| deltas.get(k)) {
             delta_color(delta.diff_pct())
         } else {
             delta_color(0.0)
@@ -179,25 +180,51 @@ fn render_diff_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, deltas: &
     }
 }
 
-/// Draw a highlight rectangle around a node matched by path.
-pub fn render_highlight(ctx: &CanvasRenderingContext2d, root: &LayoutNode, target_path: &[String]) {
-    if let Some(node) = find_node_by_path(root, target_path) {
+/// Highlight every leaf in `root` whose stable symbol key is in `keys`.
+///
+/// Matches by symbol identity rather than display path: the two comparison
+/// trees are built and clustered independently, so the same symbol can end
+/// up at a different collapsed directory path in each one (unknown-symbol
+/// clustering, a moved source file, an added/removed sibling that changes
+/// whether a chain collapses). A path-based walk fails silently whenever
+/// that happens; a key lookup does not, and works the same way whether one
+/// leaf is being cross-highlighted or a whole hovered directory's worth.
+pub fn render_highlight(ctx: &CanvasRenderingContext2d, root: &LayoutNode, keys: &HashSet<SymbolKey>) {
+    for leaf in matching_leaves(root, keys) {
         ctx.set_stroke_style_str("rgba(59, 130, 246, 0.9)");
         ctx.set_line_width(2.5);
-        ctx.stroke_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
+        ctx.stroke_rect(leaf.rect.x, leaf.rect.y, leaf.rect.w, leaf.rect.h);
     }
 }
 
-fn find_node_by_path<'a>(node: &'a LayoutNode, path: &[String]) -> Option<&'a LayoutNode> {
-    if path.is_empty() {
-        return Some(node);
+/// Every leaf under `node` whose stable symbol key is in `keys` — the
+/// selection half of cross-highlighting, kept canvas-free so it can be unit
+/// tested. Matches by identity, not display path: the two comparison trees
+/// are built and clustered independently, so the same symbol can end up at a
+/// different collapsed directory path in each one (unknown-symbol
+/// clustering, a moved source file, an added/removed sibling that changes
+/// whether a chain collapses). A path-based walk fails silently whenever
+/// that happens; a key lookup does not, and works the same way whether one
+/// leaf is being cross-highlighted or a whole hovered directory's worth.
+fn matching_leaves<'a>(node: &'a LayoutNode, keys: &HashSet<SymbolKey>) -> Vec<&'a LayoutNode> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    collect_matching_leaves(node, keys, &mut matches);
+    matches
+}
+
+fn collect_matching_leaves<'a>(node: &'a LayoutNode, keys: &HashSet<SymbolKey>, matches: &mut Vec<&'a LayoutNode>) {
+    if node.is_leaf {
+        if node.key.as_ref().is_some_and(|k| keys.contains(k)) {
+            matches.push(node);
+        }
+        return;
     }
     for child in &node.children {
-        if child.name == path[0] {
-            return find_node_by_path(child, &path[1..]);
-        }
+        collect_matching_leaves(child, keys, matches);
     }
-    None
 }
 
 fn round_rect(ctx: &CanvasRenderingContext2d, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -333,5 +360,101 @@ fn darken(c: &crate::color::Color, amount: f64) -> crate::color::Color {
         r: (c.r as f64 * (1.0 - amount)) as u8,
         g: (c.g as f64 * (1.0 - amount)) as u8,
         b: (c.b as f64 * (1.0 - amount)) as u8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Rect;
+
+    fn leaf(x: f64, name: &str, key: Option<SymbolKey>) -> LayoutNode {
+        LayoutNode {
+            rect: Rect { x, y: 0.0, w: 10.0, h: 10.0 },
+            name: name.to_string(),
+            size: 10,
+            depth: 1,
+            is_leaf: true,
+            hue: 0.0,
+            children: Vec::new(),
+            key,
+        }
+    }
+
+    fn dir(x: f64, name: &str, children: Vec<LayoutNode>) -> LayoutNode {
+        LayoutNode {
+            rect: Rect { x, y: 0.0, w: 20.0, h: 10.0 },
+            name: name.to_string(),
+            size: 10,
+            depth: 0,
+            is_leaf: false,
+            hue: 0.0,
+            children,
+            key: None,
+        }
+    }
+
+    fn key(source: &str, name: &str) -> SymbolKey {
+        SymbolKey { source: source.to_string(), name: name.to_string() }
+    }
+
+    #[test]
+    fn test_matching_leaves_finds_leaf_despite_different_display_path() {
+        // Regression for the code-review finding: the two comparison trees
+        // collapse directories independently, so the same symbol can sit at a
+        // different display path in each ("src/a.c::keep" collapses to a
+        // single "a.c" node when it's the only file, but doesn't once a
+        // sibling "b.c" exists). A path-based walk would miss this; matching
+        // by SymbolKey must not.
+        let keep_key = key("src/a.c", "keep");
+
+        // Tree where "src" collapsed with its only child "a.c".
+        let collapsed = dir(0.0, "a.c", vec![leaf(0.0, "keep", Some(keep_key.clone()))]);
+
+        // Tree where "src" has two children, so it did NOT collapse.
+        let uncollapsed = dir(
+            0.0,
+            "src",
+            vec![
+                dir(0.0, "a.c", vec![leaf(0.0, "keep", Some(keep_key.clone()))]),
+                dir(20.0, "b.c", vec![leaf(20.0, "extra", Some(key("src/b.c", "extra")))]),
+            ],
+        );
+
+        let target: HashSet<SymbolKey> = [keep_key].into_iter().collect();
+
+        assert_eq!(matching_leaves(&collapsed, &target).len(), 1);
+        let found = matching_leaves(&uncollapsed, &target);
+        assert_eq!(found.len(), 1, "key-based match must still find the leaf under the deeper path");
+        assert_eq!(found[0].name, "keep");
+    }
+
+    #[test]
+    fn test_matching_leaves_highlights_every_leaf_in_a_group() {
+        // A directory-level hover highlights every leaf in the group, not
+        // just one — the same primitive used for a single-leaf hover.
+        let a = key("src/dir", "a");
+        let b = key("src/dir", "b");
+        let other = key("src/dir", "c");
+
+        let tree = dir(
+            0.0,
+            "dir",
+            vec![
+                leaf(0.0, "a", Some(a.clone())),
+                leaf(10.0, "b", Some(b.clone())),
+                leaf(20.0, "c", Some(other)),
+            ],
+        );
+
+        let target: HashSet<SymbolKey> = [a, b].into_iter().collect();
+        let found = matching_leaves(&tree, &target);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn test_matching_leaves_empty_keys_matches_nothing() {
+        let tree = leaf(0.0, "solo", Some(key("src/a.c", "solo")));
+        assert!(matching_leaves(&tree, &HashSet::new()).is_empty());
     }
 }

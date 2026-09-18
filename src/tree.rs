@@ -1,7 +1,38 @@
 use std::collections::HashMap;
 
+/// Stable identity for a symbol (leaf), independent of the display tree's
+/// clustering/collapsing. Two translation units may legitimately define a
+/// local symbol with the same name (ELF symbol binding allows this), so name
+/// alone is not a safe identity — pairing it with the resolved source (or
+/// `"<unknown>"`) disambiguates them. Used to match the same symbol across
+/// two independently-built comparison trees, where display-level path
+/// collapsing can differ even for logically identical symbols.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SymbolKey {
+    pub source: String,
+    pub name: String,
+}
+
+/// The stable identity for a resolved symbol. Single source of truth for
+/// both `build_tree()` (leaf identity) and comparison-mode's before/after
+/// maps, so the two always agree.
+///
+/// A symbol with no resolved source path gets its own pseudo-source keyed by
+/// name, rather than sharing the literal `"<unknown>"` every other unplaced
+/// symbol in the binary also falls under: comparison-mode's parent-node
+/// aggregation groups delta-map entries by `source`, and merging every
+/// unrelated unplaced symbol into one shared bucket would make hovering any
+/// single `<unknown>` sub-cluster sum in symbols from every other one too.
+pub fn symbol_key(sym: &crate::parse::ResolvedSymbol) -> SymbolKey {
+    let source = sym
+        .source_path
+        .clone()
+        .unwrap_or_else(|| format!("<unknown>::{}", sym.name));
+    SymbolKey { source, name: sym.name.clone() }
+}
+
 /// A node in the size tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SizeNode {
     /// Name of this node (directory name, filename, or symbol name).
     pub name: String,
@@ -9,6 +40,8 @@ pub struct SizeNode {
     pub size: u64,
     /// Child nodes. Empty for leaf (symbol) nodes.
     pub children: Vec<SizeNode>,
+    /// Stable identity, set only for leaf (symbol) nodes.
+    pub key: Option<SymbolKey>,
 }
 
 /// Flatten a SizeNode tree into a map of full path -> leaf size.
@@ -50,6 +83,7 @@ pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
         name: String::new(),
         size: 0,
         children: Vec::new(),
+        key: None,
     };
 
     for sym in symbols {
@@ -73,6 +107,7 @@ pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
                         name: part.to_string(),
                         size: 0,
                         children: Vec::new(),
+                        key: None,
                     });
                     node.children.len() - 1
                 }
@@ -80,11 +115,13 @@ pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
             node = &mut node.children[idx];
         }
 
-        // Add leaf symbol
+        // Add leaf symbol. `key` is a stable identity independent of this
+        // display tree's clustering/collapsing — see `symbol_key()`.
         node.children.push(SizeNode {
             name: parts.last().unwrap().to_string(),
             size: sym.size,
             children: Vec::new(),
+            key: Some(symbol_key(sym)),
         });
     }
 
@@ -151,6 +188,7 @@ fn cluster_unknown_children(node: &mut SizeNode) {
                 name: prefix,
                 size: 0,
                 children,
+                key: None,
             });
         } else {
             other_children.extend(children);
@@ -163,6 +201,7 @@ fn cluster_unknown_children(node: &mut SizeNode) {
             name: "<other>".to_string(),
             size: 0,
             children: other_children,
+            key: None,
         });
     }
 }

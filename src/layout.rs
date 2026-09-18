@@ -1,4 +1,4 @@
-use crate::tree::SizeNode;
+use crate::tree::{SizeNode, SymbolKey};
 
 /// A positioned rectangle in the treemap.
 #[derive(Debug, Clone)]
@@ -19,6 +19,10 @@ pub struct LayoutNode {
     pub is_leaf: bool,
     pub hue: f64,
     pub children: Vec<LayoutNode>,
+    /// Stable symbol identity, carried over from `SizeNode::key`. `Some` only
+    /// for leaves; used to match the same symbol across two independently
+    /// laid-out comparison trees regardless of display-path differences.
+    pub key: Option<SymbolKey>,
 }
 
 pub const HEADER_HEIGHT: f64 = 14.0;
@@ -80,6 +84,7 @@ fn layout_node(node: &SizeNode, rect: &Rect, depth: usize, hue_start: f64, hue_e
         is_leaf,
         hue,
         children,
+        key: node.key.clone(),
     }
 }
 
@@ -239,18 +244,21 @@ mod tests {
                     name: "big".into(),
                     size: 700,
                     children: vec![
-                        SizeNode { name: "a.c".into(), size: 400, children: vec![] },
-                        SizeNode { name: "b.c".into(), size: 300, children: vec![] },
+                        SizeNode { name: "a.c".into(), size: 400, ..Default::default() },
+                        SizeNode { name: "b.c".into(), size: 300, ..Default::default() },
                     ],
+                    ..Default::default()
                 },
                 SizeNode {
                     name: "small".into(),
                     size: 300,
                     children: vec![
-                        SizeNode { name: "c.c".into(), size: 300, children: vec![] },
+                        SizeNode { name: "c.c".into(), size: 300, ..Default::default() },
                     ],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         }
     }
 
@@ -316,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_zero_size_handled() {
-        let tree = SizeNode { name: "root".into(), size: 0, children: vec![] };
+        let tree = SizeNode { name: "root".into(), size: 0, ..Default::default() };
         let root = layout(&tree, 800.0, 600.0);
         assert_eq!(root.rect.w, 800.0);
         assert!(root.children.is_empty());
