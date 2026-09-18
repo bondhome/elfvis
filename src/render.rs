@@ -132,13 +132,23 @@ pub fn render_diff(
     ctx: &CanvasRenderingContext2d,
     root: &LayoutNode,
     deltas: &HashMap<SymbolKey, Delta>,
+    ambiguous: &HashSet<SymbolKey>,
 ) {
     ctx.set_fill_style_str("#ffffff");
     ctx.fill_rect(root.rect.x, root.rect.y, root.rect.w, root.rect.h);
-    render_diff_node(ctx, root, deltas);
+    render_diff_node(ctx, root, deltas, ambiguous);
 }
 
-fn render_diff_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, deltas: &HashMap<SymbolKey, Delta>) {
+/// Fill for a leaf whose identity is shared by several symbols: a per-symbol
+/// change can't be established, so it gets no red/green claim.
+const AMBIGUOUS_FILL: &str = "rgb(200,200,200)";
+
+fn render_diff_node(
+    ctx: &CanvasRenderingContext2d,
+    node: &LayoutNode,
+    deltas: &HashMap<SymbolKey, Delta>,
+    ambiguous: &HashSet<SymbolKey>,
+) {
     if node.rect.w < 1.0 || node.rect.h < 1.0 {
         return;
     }
@@ -146,12 +156,16 @@ fn render_diff_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, deltas: &
     if node.is_leaf {
         // Look up by stable symbol key (source + name), not bare name — two
         // translation units may legitimately define a same-named local symbol.
-        let color = if let Some(delta) = node.key.as_ref().and_then(|k| deltas.get(k)) {
-            delta_color(delta.diff_pct())
+        if node.key.as_ref().is_some_and(|k| ambiguous.contains(k)) {
+            ctx.set_fill_style_str(AMBIGUOUS_FILL);
         } else {
-            delta_color(0.0)
-        };
-        ctx.set_fill_style_str(&color.to_css());
+            let color = if let Some(delta) = node.key.as_ref().and_then(|k| deltas.get(k)) {
+                delta_color(delta.diff_pct())
+            } else {
+                delta_color(0.0)
+            };
+            ctx.set_fill_style_str(&color.to_css());
+        }
         ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
 
         ctx.set_stroke_style_str("rgba(0,0,0,1)");
@@ -169,7 +183,7 @@ fn render_diff_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, deltas: &
         }
 
         for child in &node.children {
-            render_diff_node(ctx, child, deltas);
+            render_diff_node(ctx, child, deltas, ambiguous);
         }
 
         if node.depth > 0 {
@@ -180,50 +194,42 @@ fn render_diff_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, deltas: &
     }
 }
 
-/// Highlight every leaf in `root` whose stable symbol key is in `keys`.
-///
-/// Matches by symbol identity rather than display path: the two comparison
-/// trees are built and clustered independently, so the same symbol can end
-/// up at a different collapsed directory path in each one (unknown-symbol
-/// clustering, a moved source file, an added/removed sibling that changes
-/// whether a chain collapses). A path-based walk fails silently whenever
-/// that happens; a key lookup does not, and works the same way whether one
-/// leaf is being cross-highlighted or a whole hovered directory's worth.
-pub fn render_highlight(ctx: &CanvasRenderingContext2d, root: &LayoutNode, keys: &HashSet<SymbolKey>) {
-    for leaf in matching_leaves(root, keys) {
+/// Highlight every leaf in `root` whose stable symbol key satisfies `wanted`.
+pub fn render_highlight(ctx: &CanvasRenderingContext2d, root: &LayoutNode, wanted: &dyn Fn(&SymbolKey) -> bool) {
+    for leaf in matching_leaves(root, wanted) {
         ctx.set_stroke_style_str("rgba(59, 130, 246, 0.9)");
         ctx.set_line_width(2.5);
         ctx.stroke_rect(leaf.rect.x, leaf.rect.y, leaf.rect.w, leaf.rect.h);
     }
 }
 
-/// Every leaf under `node` whose stable symbol key is in `keys` — the
+/// Every leaf under `node` whose stable symbol key satisfies `wanted` — the
 /// selection half of cross-highlighting, kept canvas-free so it can be unit
 /// tested. Matches by identity, not display path: the two comparison trees
 /// are built and clustered independently, so the same symbol can end up at a
-/// different collapsed directory path in each one (unknown-symbol
-/// clustering, a moved source file, an added/removed sibling that changes
-/// whether a chain collapses). A path-based walk fails silently whenever
-/// that happens; a key lookup does not, and works the same way whether one
-/// leaf is being cross-highlighted or a whole hovered directory's worth.
-fn matching_leaves<'a>(node: &'a LayoutNode, keys: &HashSet<SymbolKey>) -> Vec<&'a LayoutNode> {
-    if keys.is_empty() {
-        return Vec::new();
-    }
+/// different collapsed directory path in each one. The predicate is either
+/// "is this exact key" (hovering a leaf) or `Group::contains` (hovering a
+/// directory), so a whole group is highlighted even where the other tree
+/// arranges those symbols differently.
+fn matching_leaves<'a>(node: &'a LayoutNode, wanted: &dyn Fn(&SymbolKey) -> bool) -> Vec<&'a LayoutNode> {
     let mut matches = Vec::new();
-    collect_matching_leaves(node, keys, &mut matches);
+    collect_matching_leaves(node, wanted, &mut matches);
     matches
 }
 
-fn collect_matching_leaves<'a>(node: &'a LayoutNode, keys: &HashSet<SymbolKey>, matches: &mut Vec<&'a LayoutNode>) {
+fn collect_matching_leaves<'a>(
+    node: &'a LayoutNode,
+    wanted: &dyn Fn(&SymbolKey) -> bool,
+    matches: &mut Vec<&'a LayoutNode>,
+) {
     if node.is_leaf {
-        if node.key.as_ref().is_some_and(|k| keys.contains(k)) {
+        if node.key.as_ref().is_some_and(wanted) {
             matches.push(node);
         }
         return;
     }
     for child in &node.children {
-        collect_matching_leaves(child, keys, matches);
+        collect_matching_leaves(child, wanted, matches);
     }
 }
 
@@ -367,6 +373,7 @@ fn darken(c: &crate::color::Color, amount: f64) -> crate::color::Color {
 mod tests {
     use super::*;
     use crate::layout::Rect;
+    use crate::tree::Group;
 
     fn leaf(x: f64, name: &str, key: Option<SymbolKey>) -> LayoutNode {
         LayoutNode {
@@ -378,6 +385,7 @@ mod tests {
             hue: 0.0,
             children: Vec::new(),
             key,
+            group: None,
         }
     }
 
@@ -391,27 +399,21 @@ mod tests {
             hue: 0.0,
             children,
             key: None,
+            group: None,
         }
     }
 
     fn key(source: &str, name: &str) -> SymbolKey {
-        SymbolKey { source: source.to_string(), name: name.to_string() }
+        SymbolKey { source: Some(source.to_string()), name: name.to_string(), tu: None }
     }
 
     #[test]
     fn test_matching_leaves_finds_leaf_despite_different_display_path() {
-        // Regression for the code-review finding: the two comparison trees
-        // collapse directories independently, so the same symbol can sit at a
-        // different display path in each ("src/a.c::keep" collapses to a
-        // single "a.c" node when it's the only file, but doesn't once a
-        // sibling "b.c" exists). A path-based walk would miss this; matching
-        // by SymbolKey must not.
+        // The two comparison trees collapse directories independently, so the
+        // same symbol can sit at a different display path in each. Matching by
+        // SymbolKey must not care.
         let keep_key = key("src/a.c", "keep");
-
-        // Tree where "src" collapsed with its only child "a.c".
         let collapsed = dir(0.0, "a.c", vec![leaf(0.0, "keep", Some(keep_key.clone()))]);
-
-        // Tree where "src" has two children, so it did NOT collapse.
         let uncollapsed = dir(
             0.0,
             "src",
@@ -421,40 +423,36 @@ mod tests {
             ],
         );
 
-        let target: HashSet<SymbolKey> = [keep_key].into_iter().collect();
-
-        assert_eq!(matching_leaves(&collapsed, &target).len(), 1);
-        let found = matching_leaves(&uncollapsed, &target);
-        assert_eq!(found.len(), 1, "key-based match must still find the leaf under the deeper path");
+        let is_keep = |k: &SymbolKey| *k == keep_key;
+        assert_eq!(matching_leaves(&collapsed, &is_keep).len(), 1);
+        let found = matching_leaves(&uncollapsed, &is_keep);
+        assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "keep");
     }
 
     #[test]
-    fn test_matching_leaves_highlights_every_leaf_in_a_group() {
-        // A directory-level hover highlights every leaf in the group, not
-        // just one — the same primitive used for a single-leaf hover.
-        let a = key("src/dir", "a");
-        let b = key("src/dir", "b");
-        let other = key("src/dir", "c");
-
-        let tree = dir(
+    fn test_matching_leaves_by_group_covers_members_the_hovered_tree_lacks() {
+        // Hovering directory `src` in one tree highlights every `src` member in
+        // the *other* tree, including files that exist only there.
+        let group = Group::Dir(vec!["src".into()]);
+        let other = dir(
             0.0,
-            "dir",
+            "root",
             vec![
-                leaf(0.0, "a", Some(a.clone())),
-                leaf(10.0, "b", Some(b.clone())),
-                leaf(20.0, "c", Some(other)),
+                leaf(0.0, "keep", Some(key("src/a.c", "keep"))),
+                leaf(10.0, "added", Some(key("src/c.c", "added"))),
+                leaf(20.0, "elsewhere", Some(key("lib/x.c", "elsewhere"))),
             ],
         );
-
-        let target: HashSet<SymbolKey> = [a, b].into_iter().collect();
-        let found = matching_leaves(&tree, &target);
-        assert_eq!(found.len(), 2);
+        let found = matching_leaves(&other, &|k| group.contains(k));
+        let mut names: Vec<_> = found.iter().map(|l| l.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["added", "keep"]);
     }
 
     #[test]
-    fn test_matching_leaves_empty_keys_matches_nothing() {
+    fn test_matching_leaves_nothing_wanted_matches_nothing() {
         let tree = leaf(0.0, "solo", Some(key("src/a.c", "solo")));
-        assert!(matching_leaves(&tree, &HashSet::new()).is_empty());
+        assert!(matching_leaves(&tree, &|_| false).is_empty());
     }
 }

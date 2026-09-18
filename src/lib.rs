@@ -3,6 +3,7 @@ pub mod tree;
 pub mod layout;
 pub mod color;
 pub mod diff;
+pub mod compare;
 mod render;
 
 use wasm_bindgen::prelude::*;
@@ -21,12 +22,12 @@ struct AppState {
     canvas_height: f64,
     dpr: f64,
     // Comparison mode
-    size_tree: Option<tree::SizeNode>,
-    symbol_sizes: Option<std::collections::HashMap<tree::SymbolKey, u64>>,
+    symbols: Option<Vec<parse::SymbolDetail>>,
     compare_layout: Option<layout::LayoutNode>,
     compare_filename: String,
     compare_total_size: u64,
     diff_map: Option<std::collections::HashMap<tree::SymbolKey, diff::Delta>>,
+    ambiguous: std::collections::HashSet<tree::SymbolKey>,
 }
 
 thread_local! {
@@ -37,12 +38,12 @@ thread_local! {
         canvas_width: 0.0,
         canvas_height: 0.0,
         dpr: 1.0,
-        size_tree: None,
-        symbol_sizes: None,
+        symbols: None,
         compare_layout: None,
         compare_filename: String::new(),
         compare_total_size: 0,
         diff_map: None,
+        ambiguous: std::collections::HashSet::new(),
     });
 }
 
@@ -73,12 +74,12 @@ pub fn main() -> Result<(), JsValue> {
         STATE.with(|s| {
             let mut state = s.borrow_mut();
             state.layout_root = None;
-            state.size_tree = None;
-            state.symbol_sizes = None;
+            state.symbols = None;
             state.compare_layout = None;
             state.compare_filename = String::new();
             state.compare_total_size = 0;
             state.diff_map = None;
+            state.ambiguous.clear();
         });
 
         doc.get_element_by_id("header").unwrap()
@@ -223,9 +224,16 @@ fn load_file(file: web_sys::File) {
 fn process_elf(filename: &str, data: &[u8]) {
     let document = window().unwrap().document().unwrap();
 
-    match parse::parse_elf(data) {
-        Ok(symbols) => {
-            let sym_map = symbols_to_map(&symbols);
+    match parse::parse_elf_detailed(data) {
+        Ok(details) => {
+            let symbols: Vec<parse::ResolvedSymbol> = details
+                .iter()
+                .map(|d| parse::ResolvedSymbol {
+                    name: d.name.clone(),
+                    size: d.size,
+                    source_path: d.display_path.clone(),
+                })
+                .collect();
             let size_tree = tree::build_tree(&symbols);
             let total_size = size_tree.size;
             let win = window().unwrap();
@@ -237,8 +245,7 @@ fn process_elf(filename: &str, data: &[u8]) {
 
             STATE.with(|s| {
                 let mut state = s.borrow_mut();
-                state.size_tree = Some(size_tree);
-                state.symbol_sizes = Some(sym_map);
+                state.symbols = Some(details);
                 state.layout_root = Some(layout_root);
                 state.filename = filename.to_string();
                 state.total_size = total_size;
@@ -323,29 +330,6 @@ fn size_change_pct(before: u64, after: u64) -> f64 {
     }
 }
 
-/// Collect the stable keys of every leaf (symbol) under `node`.
-fn collect_leaf_keys(node: &layout::LayoutNode) -> std::collections::HashSet<tree::SymbolKey> {
-    let mut keys = std::collections::HashSet::new();
-    collect_leaf_keys_recursive(node, &mut keys);
-    keys
-}
-
-fn collect_leaf_keys_recursive(node: &layout::LayoutNode, keys: &mut std::collections::HashSet<tree::SymbolKey>) {
-    if node.is_leaf {
-        if let Some(k) = &node.key {
-            keys.insert(k.clone());
-        }
-    } else {
-        for child in &node.children {
-            collect_leaf_keys_recursive(child, keys);
-        }
-    }
-}
-
-fn symbols_to_map(symbols: &[parse::ResolvedSymbol]) -> std::collections::HashMap<tree::SymbolKey, u64> {
-    symbols.iter().map(|s| (tree::symbol_key(s), s.size)).collect()
-}
-
 fn load_compare_file(file: web_sys::File) {
     let filename = file.name();
     let reader = FileReader::new().unwrap();
@@ -364,40 +348,31 @@ fn load_compare_file(file: web_sys::File) {
 fn process_compare_elf(filename: &str, data: &[u8]) {
     let document = window().unwrap().document().unwrap();
 
-    match parse::parse_elf(data) {
-        Ok(symbols) => {
-            let size_tree_b = tree::build_tree(&symbols);
-            let total_b = size_tree_b.size;
+    match parse::parse_elf_detailed(data) {
+        Ok(symbols_b) => {
             let win = window().unwrap();
             let full_w = win.inner_width().unwrap().as_f64().unwrap();
             let h = win.inner_height().unwrap().as_f64().unwrap() - 36.0;
             let half_w = (full_w - 2.0) / 2.0;
             let dpr = win.device_pixel_ratio();
 
-            let layout_b = layout::layout(&size_tree_b, half_w, h);
-
-            // Build diff by symbol name (not tree path, which varies due to clustering)
-            let paths_b = symbols_to_map(&symbols);
-
-            // Re-layout tree A at half width and compute diff
             STATE.with(|s| {
                 let mut state = s.borrow_mut();
-                let paths_a = state.symbol_sizes.clone().unwrap_or_default();
+                // Identity, normalization and both display trees come from one
+                // pure pass over the pair — see `compare::compare`.
+                let cmp = compare::compare(state.symbols.as_deref().unwrap_or(&[]), &symbols_b);
 
-                if let Some(ref tree_a) = state.size_tree {
-                    state.layout_root = Some(layout::layout(tree_a, half_w, h));
-                }
-
-                let diff_map = diff::compute_diff(&paths_a, &paths_b);
-
-                state.compare_layout = Some(layout_b);
+                state.layout_root = Some(layout::layout(&cmp.tree_a, half_w, h));
+                state.compare_layout = Some(layout::layout(&cmp.tree_b, half_w, h));
                 state.compare_filename = filename.to_string();
-                state.compare_total_size = total_b;
-                state.diff_map = Some(diff_map);
+                state.compare_total_size = cmp.tree_b.size;
+                state.diff_map = Some(cmp.deltas);
+                state.ambiguous = cmp.ambiguous;
                 state.canvas_width = half_w;
                 state.canvas_height = h;
                 state.dpr = dpr;
             });
+            let total_b = STATE.with(|s| s.borrow().compare_total_size);
 
             // Update header
             STATE.with(|s| {
@@ -468,13 +443,13 @@ fn render_comparison(dpr: f64) {
             let ctx_a = canvas_a.get_context("2d").unwrap().unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
             ctx_a.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
-            render::render_diff(&ctx_a, root_a, deltas);
+            render::render_diff(&ctx_a, root_a, deltas, &state.ambiguous);
 
             let canvas_b: HtmlCanvasElement = document.get_element_by_id("canvas-b").unwrap().unchecked_into();
             let ctx_b = canvas_b.get_context("2d").unwrap().unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
             ctx_b.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
-            render::render_diff(&ctx_b, root_b, deltas);
+            render::render_diff(&ctx_b, root_b, deltas, &state.ambiguous);
         }
     });
 }
@@ -500,13 +475,13 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
             let ctx_a = canvas_a.get_context("2d").unwrap().unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
             ctx_a.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
-            render::render_diff(&ctx_a, state.layout_root.as_ref().unwrap(), deltas);
+            render::render_diff(&ctx_a, state.layout_root.as_ref().unwrap(), deltas, &state.ambiguous);
 
             let canvas_b: HtmlCanvasElement = doc.get_element_by_id("canvas-b").unwrap().unchecked_into();
             let ctx_b = canvas_b.get_context("2d").unwrap().unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
             ctx_b.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
-            render::render_diff(&ctx_b, state.compare_layout.as_ref().unwrap(), deltas);
+            render::render_diff(&ctx_b, state.compare_layout.as_ref().unwrap(), deltas, &state.ambiguous);
 
             if let Some(path) = layout::hit_test(hovered, x, y) {
                 // Walk to hovered node (within the hovered tree's own display
@@ -521,20 +496,19 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
                     }
                 }
 
-                // The set of stable symbol keys this hovered box represents —
-                // one key for a leaf, every descendant leaf's key for a
-                // directory. Drives both cross-highlighting (by identity, not
-                // by display path, so it still finds the match when the two
-                // trees collapse differently) and, for directories, which
-                // delta-map entries belong to this logical group.
-                let group_keys: std::collections::HashSet<tree::SymbolKey> = if node.is_leaf {
-                    node.key.iter().cloned().collect()
-                } else {
-                    collect_leaf_keys(node)
-                };
-
+                // What the hovered box stands for: one exact symbol for a leaf,
+                // a logical group (directory / unresolved cluster) otherwise.
+                // Both cross-highlighting and the parent total are defined by
+                // membership in that, evaluated over the whole comparison —
+                // not over whatever leaves the hovered tree happens to hold.
                 let other_ctx = if is_canvas_b { &ctx_a } else { &ctx_b };
-                render::render_highlight(other_ctx, other, &group_keys);
+                if node.is_leaf {
+                    if let Some(key) = &node.key {
+                        render::render_highlight(other_ctx, other, &|k| k == key);
+                    }
+                } else if let Some(group) = &node.group {
+                    render::render_highlight(other_ctx, other, &|k| group.contains(k));
+                }
 
                 let display_name = path.last().map(|s| s.as_str()).unwrap_or("");
                 let tooltip = if node.is_leaf {
@@ -544,21 +518,18 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
                         let diff = delta.diff_bytes();
                         let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
                         let diff_str = format!("{sign}{}", format_size(abs_diff));
-                        format!("{display_name}\n{before_str} \u{2192} {after_str}\n{diff_str}")
+                        if node.key.as_ref().is_some_and(|k| state.ambiguous.contains(k)) {
+                            format!(
+                                "{display_name}\nambiguous: several same-named symbols\ncombined {before_str} \u{2192} {after_str} ({diff_str})"
+                            )
+                        } else {
+                            format!("{display_name}\n{before_str} \u{2192} {after_str}\n{diff_str}")
+                        }
                     } else {
                         display_name.to_string()
                     }
-                } else {
-                    // Parent: sum before/after over every delta-map entry whose
-                    // *source* belongs to this group — not just the leaves
-                    // present in the hovered tree's own subtree. A symbol only
-                    // added in the other file has no leaf here to enumerate,
-                    // and one only removed has no leaf in the other tree, so
-                    // restricting the sum to one side's own traversal silently
-                    // dropped exactly the additions/removals that matter.
-                    let group_sources: std::collections::HashSet<&str> =
-                        group_keys.iter().map(|k| k.source.as_str()).collect();
-                    let (total_before, total_after) = diff::aggregate_by_source(deltas, &group_sources);
+                } else if let Some(group) = &node.group {
+                    let (total_before, total_after) = diff::aggregate_group(deltas, group);
                     let diff = total_after as i64 - total_before as i64;
                     let (sign, abs_diff) = if diff >= 0 { ("+", diff as u64) } else { ("-", (-diff) as u64) };
                     let diff_str = format!("{sign}{}", format_size(abs_diff));
@@ -573,6 +544,8 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
                         format_size(total_before),
                         format_size(total_after),
                     )
+                } else {
+                    display_name.to_string()
                 };
 
                 // Show tooltip on hovered canvas

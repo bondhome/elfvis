@@ -1,4 +1,4 @@
-use crate::tree::{SizeNode, SymbolKey};
+use crate::tree::{Group, SizeNode, SymbolKey};
 
 /// A positioned rectangle in the treemap.
 #[derive(Debug, Clone)]
@@ -23,6 +23,9 @@ pub struct LayoutNode {
     /// for leaves; used to match the same symbol across two independently
     /// laid-out comparison trees regardless of display-path differences.
     pub key: Option<SymbolKey>,
+    /// Logical membership of a directory-like node, carried over from
+    /// `SizeNode::group`; `None` for leaves.
+    pub group: Option<Group>,
 }
 
 pub const HEADER_HEIGHT: f64 = 14.0;
@@ -85,6 +88,7 @@ fn layout_node(node: &SizeNode, rect: &Rect, depth: usize, hue_start: f64, hue_e
         hue,
         children,
         key: node.key.clone(),
+        group: node.group.clone(),
     }
 }
 

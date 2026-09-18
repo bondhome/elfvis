@@ -1,34 +1,57 @@
 use std::collections::HashMap;
 
 /// Stable identity for a symbol (leaf), independent of the display tree's
-/// clustering/collapsing. Two translation units may legitimately define a
-/// local symbol with the same name (ELF symbol binding allows this), so name
-/// alone is not a safe identity — pairing it with the resolved source (or
-/// `"<unknown>"`) disambiguates them. Used to match the same symbol across
-/// two independently-built comparison trees, where display-level path
-/// collapsing can differ even for logically identical symbols.
+/// clustering/collapsing.
+///
+/// `source` is `None` when DWARF could not place the symbol. `tu` is the
+/// translation unit (from the ELF's `STT_FILE` provenance) and is only filled
+/// in when `(source, name)` alone is not unique — see `compare::compare`. Two
+/// object files may legitimately define same-named locals, even attributed to
+/// the same header, so neither name nor source file is a translation-unit
+/// identity on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SymbolKey {
-    pub source: String,
+    pub source: Option<String>,
     pub name: String,
+    pub tu: Option<String>,
 }
 
-/// The stable identity for a resolved symbol. Single source of truth for
-/// both `build_tree()` (leaf identity) and comparison-mode's before/after
-/// maps, so the two always agree.
-///
-/// A symbol with no resolved source path gets its own pseudo-source keyed by
-/// name, rather than sharing the literal `"<unknown>"` every other unplaced
-/// symbol in the binary also falls under: comparison-mode's parent-node
-/// aggregation groups delta-map entries by `source`, and merging every
-/// unrelated unplaced symbol into one shared bucket would make hovering any
-/// single `<unknown>` sub-cluster sum in symbols from every other one too.
+/// The default identity used by single-file mode: `(source, name)`.
 pub fn symbol_key(sym: &crate::parse::ResolvedSymbol) -> SymbolKey {
-    let source = sym
-        .source_path
-        .clone()
-        .unwrap_or_else(|| format!("<unknown>::{}", sym.name));
-    SymbolKey { source, name: sym.name.clone() }
+    SymbolKey { source: sym.source_path.clone(), name: sym.name.clone(), tu: None }
+}
+
+/// A logical group of symbols that a directory-like tree node stands for,
+/// defined as a predicate over `SymbolKey` rather than as "whatever leaves this
+/// one tree happens to contain". Comparison mode needs that: the two trees are
+/// built from different symbol sets, so a group's membership must be evaluated
+/// over both inputs (e.g. a file added only in the new ELF still belongs to
+/// its directory when the old ELF's directory node is hovered).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Group {
+    /// The whole tree.
+    All,
+    /// Symbols whose source path lies under this directory (path components).
+    Dir(Vec<String>),
+    /// Symbols DWARF could not place. `None` = all of them; `Some(prefixes)` =
+    /// only those whose name-cluster prefix (see `extract_prefix`) is listed.
+    Unresolved(Option<Vec<String>>),
+}
+
+impl Group {
+    pub fn contains(&self, key: &SymbolKey) -> bool {
+        match self {
+            Group::All => true,
+            Group::Dir(dir) => key.source.as_deref().is_some_and(|s| {
+                let mut comps = s.split('/').filter(|c| !c.is_empty());
+                dir.iter().all(|d| comps.next() == Some(d.as_str()))
+            }),
+            Group::Unresolved(None) => key.source.is_none(),
+            Group::Unresolved(Some(prefixes)) => {
+                key.source.is_none() && prefixes.contains(&extract_prefix(&key.name))
+            }
+        }
+    }
 }
 
 /// A node in the size tree.
@@ -42,6 +65,8 @@ pub struct SizeNode {
     pub children: Vec<SizeNode>,
     /// Stable identity, set only for leaf (symbol) nodes.
     pub key: Option<SymbolKey>,
+    /// Logical membership of a directory-like node; `None` for leaves.
+    pub group: Option<Group>,
 }
 
 /// Flatten a SizeNode tree into a map of full path -> leaf size.
@@ -79,14 +104,24 @@ fn flatten_recursive(node: &SizeNode, prefix: &mut String, map: &mut HashMap<Str
 /// Paths are split on '/' to create the directory hierarchy.
 /// Symbols without a source path go under "<unknown>".
 pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
+    let keys: Vec<SymbolKey> = symbols.iter().map(symbol_key).collect();
+    build_tree_with_keys(symbols, &keys)
+}
+
+/// Like [`build_tree`], but each leaf carries the caller-supplied identity in
+/// `keys` (parallel to `symbols`) — comparison mode assigns those jointly over
+/// both inputs so a symbol gets the same key in both trees.
+pub fn build_tree_with_keys(symbols: &[crate::parse::ResolvedSymbol], keys: &[SymbolKey]) -> SizeNode {
+    assert_eq!(symbols.len(), keys.len());
     let mut root = SizeNode {
         name: String::new(),
         size: 0,
         children: Vec::new(),
         key: None,
+        group: Some(Group::All),
     };
 
-    for sym in symbols {
+    for (sym, key) in symbols.iter().zip(keys) {
         let path = match &sym.source_path {
             Some(p) => p.as_str(),
             None => "<unknown>",
@@ -98,16 +133,22 @@ pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
 
         // Walk/create the tree
         let mut node = &mut root;
-        for part in &parts[..parts.len() - 1] {
+        for (depth, part) in parts[..parts.len() - 1].iter().enumerate() {
             let idx = node.children.iter().position(|c| c.name == *part);
             let idx = match idx {
                 Some(i) => i,
                 None => {
+                    let group = if sym.source_path.is_none() {
+                        Group::Unresolved(None)
+                    } else {
+                        Group::Dir(parts[..=depth].iter().map(|c| c.to_string()).collect())
+                    };
                     node.children.push(SizeNode {
                         name: part.to_string(),
                         size: 0,
                         children: Vec::new(),
                         key: None,
+                        group: Some(group),
                     });
                     node.children.len() - 1
                 }
@@ -116,12 +157,13 @@ pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
         }
 
         // Add leaf symbol. `key` is a stable identity independent of this
-        // display tree's clustering/collapsing — see `symbol_key()`.
+        // display tree's clustering/collapsing.
         node.children.push(SizeNode {
             name: parts.last().unwrap().to_string(),
             size: sym.size,
             children: Vec::new(),
-            key: Some(symbol_key(sym)),
+            key: Some(key.clone()),
+            group: None,
         });
     }
 
@@ -155,6 +197,9 @@ fn collapse_single_children(node: &mut SizeNode) {
             node.name = format!("{}/{}", node.name, only_child.name);
         }
         node.children = only_child.children;
+        // A single-child chain has the same members top to bottom; keep the
+        // deepest (most specific) group.
+        node.group = only_child.group;
     }
 }
 
@@ -185,10 +230,11 @@ fn cluster_unknown_children(node: &mut SizeNode) {
     for (prefix, children) in buckets {
         if children.len() >= 2 {
             node.children.push(SizeNode {
-                name: prefix,
+                name: prefix.clone(),
                 size: 0,
                 children,
                 key: None,
+                group: Some(Group::Unresolved(Some(vec![prefix]))),
             });
         } else {
             other_children.extend(children);
@@ -197,11 +243,16 @@ fn cluster_unknown_children(node: &mut SizeNode) {
 
     // Add <other> if non-empty
     if !other_children.is_empty() {
+        let mut prefixes: Vec<String> =
+            other_children.iter().map(|c| extract_prefix(&c.name)).collect();
+        prefixes.sort();
+        prefixes.dedup();
         node.children.push(SizeNode {
             name: "<other>".to_string(),
             size: 0,
             children: other_children,
             key: None,
+            group: Some(Group::Unresolved(Some(prefixes))),
         });
     }
 }
@@ -215,7 +266,7 @@ fn cluster_unknown_children(node: &mut SizeNode) {
 /// 4. Single lowercase + `_` (Hungarian) → strip 2, extract token from remainder
 /// 5. Single lowercase + uppercase (Hungarian) → strip 1, extract token from remainder
 /// 6. Default → first token split on `_`, `.`, or camelCase boundary
-fn extract_prefix(name: &str) -> String {
+pub fn extract_prefix(name: &str) -> String {
     if name.starts_with("__") {
         return "__".to_string();
     }

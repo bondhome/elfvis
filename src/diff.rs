@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::tree::SymbolKey;
+use crate::tree::{Group, SymbolKey};
 
 /// Delta info for a single path.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,23 +50,21 @@ pub fn compute_diff<K: std::hash::Hash + Eq + Clone>(
     result
 }
 
-/// Sum before/after totals across every entry in `deltas` whose key's
-/// `source` is one of `group_sources` — i.e. every symbol logically
-/// belonging to a hovered directory group, in *either* file.
+/// Sum before/after totals across every entry in `deltas` that belongs to
+/// `group` — i.e. every symbol logically part of a hovered directory or
+/// cluster, in *either* file.
 ///
-/// This must scan the whole delta map rather than one tree's own leaves:
-/// a symbol only added in the "after" file has no leaf in the "before"
-/// tree to enumerate, and one only removed has no leaf in the "after"
-/// tree, so restricting the sum to whichever side happened to be hovered
-/// silently dropped exactly the additions/removals that matter.
-pub fn aggregate_by_source(
-    deltas: &HashMap<SymbolKey, Delta>,
-    group_sources: &HashSet<&str>,
-) -> (u64, u64) {
+/// Membership is a predicate over the symbol's identity (`Group::contains`),
+/// not a list collected from whichever tree was hovered: a symbol only added
+/// in the "after" file has no leaf in the "before" tree, and a whole source
+/// file added or removed adds sources the hovered side never saw, so any set
+/// derived from one side's own leaves silently drops exactly the additions and
+/// removals that matter.
+pub fn aggregate_group(deltas: &HashMap<SymbolKey, Delta>, group: &Group) -> (u64, u64) {
     let mut total_before = 0u64;
     let mut total_after = 0u64;
     for (key, delta) in deltas {
-        if group_sources.contains(key.source.as_str()) {
+        if group.contains(key) {
             total_before += delta.before.unwrap_or(0);
             total_after += delta.after.unwrap_or(0);
         }
@@ -147,8 +145,8 @@ mod tests {
         // distinct even though `name` alone collides.
         use crate::tree::SymbolKey;
 
-        let a_helper = SymbolKey { source: "a.c".into(), name: "helper".into() };
-        let b_helper = SymbolKey { source: "b.c".into(), name: "helper".into() };
+        let a_helper = SymbolKey { source: Some("a.c".into()), name: "helper".into(), tu: None };
+        let b_helper = SymbolKey { source: Some("b.c".into()), name: "helper".into(), tu: None };
 
         let before = HashMap::from([(a_helper.clone(), 22u64), (b_helper.clone(), 22u64)]);
         let after = HashMap::from([(a_helper.clone(), 50u64), (b_helper.clone(), 22u64)]);
@@ -156,33 +154,6 @@ mod tests {
         let diff = compute_diff(&before, &after);
         assert_eq!(diff.get(&a_helper).unwrap().diff_bytes(), 28, "a.c::helper grew 22 -> 50");
         assert_eq!(diff.get(&b_helper).unwrap().diff_bytes(), 0, "b.c::helper is unchanged");
-    }
-
-    #[test]
-    fn test_aggregate_by_source_includes_added_and_removed_regardless_of_side() {
-        // Regression for the code-review finding: hovering a directory used to
-        // sum only the leaves present in whichever tree was hovered, so an
-        // added symbol (no leaf in "before") or a removed one (no leaf in
-        // "after") was silently dropped from that side's total. before =
-        // {keep:100, gone:50} -> after = {keep:100, added:80}; correct total
-        // is 150 -> 180, independent of which panel triggered the hover.
-        let deltas = HashMap::from([
-            (
-                SymbolKey { source: "src/a.c".into(), name: "keep".into() },
-                Delta { before: Some(100), after: Some(100) },
-            ),
-            (
-                SymbolKey { source: "src/a.c".into(), name: "gone".into() },
-                Delta { before: Some(50), after: None },
-            ),
-            (
-                SymbolKey { source: "src/a.c".into(), name: "added".into() },
-                Delta { before: None, after: Some(80) },
-            ),
-        ]);
-        let group_sources = HashSet::from(["src/a.c"]);
-
-        assert_eq!(aggregate_by_source(&deltas, &group_sources), (150, 180));
     }
 
     #[test]
