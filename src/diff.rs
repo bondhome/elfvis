@@ -13,6 +13,12 @@ impl Delta {
     }
 
     pub fn diff_pct(&self) -> f64 {
+        if self.after.is_none() && self.before.is_some() {
+            // Removed: use a sentinel so delta_color() can render it as bright red
+            // ("removed") rather than folding it into the green "shrank 100%" case.
+            return f64::NEG_INFINITY;
+        }
+
         let b = self.before.unwrap_or(0) as f64;
         if b == 0.0 {
             if self.after.unwrap_or(0) > 0 { f64::INFINITY } else { 0.0 }
@@ -94,8 +100,29 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_pct_removed() {
+    fn test_diff_pct_removed_is_neg_infinity() {
+        // Regression: a removed symbol (before=Some, after=None) must report
+        // NEG_INFINITY, not -100.0 — otherwise delta_color() renders it as
+        // "shrank 100%" (green) instead of "removed" (bright red). Reported by
+        // Chris: https://github.com/bondhome/elfvis/pull/2#issuecomment (color
+        // direction "seems to be backwards").
         let d = Delta { before: Some(100), after: None };
-        assert!((d.diff_pct() - (-100.0)).abs() < 0.01);
+        assert_eq!(d.diff_pct(), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_removed_symbol_colors_bright_red_not_green() {
+        use crate::color::delta_color;
+
+        let d = Delta { before: Some(100), after: None };
+        let c = delta_color(d.diff_pct());
+        assert!(
+            c.r > 150 && c.g < 150,
+            "removed symbol should render bright red like the new-symbol case, \
+             got rgb({},{},{})",
+            c.r,
+            c.g,
+            c.b
+        );
     }
 }

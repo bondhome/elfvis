@@ -6,6 +6,9 @@ use crate::color::{delta_color, pastel_color};
 use crate::diff::Delta;
 use crate::layout::{LayoutNode, HEADER_HEIGHT, MIN_HEADER_HEIGHT};
 
+const MONO_FONT_STACK: &str =
+    "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
+
 pub fn render(ctx: &CanvasRenderingContext2d, root: &LayoutNode) {
     ctx.set_fill_style_str("#ffffff");
     ctx.fill_rect(root.rect.x, root.rect.y, root.rect.w, root.rect.h);
@@ -35,48 +38,7 @@ fn render_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode) {
             ctx.set_fill_style_str(&header_color.to_css());
             ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, HEADER_HEIGHT);
 
-            let pad = 4.0;
-            let max_w = node.rect.w - pad * 2.0;
-            let y_mid = node.rect.y + HEADER_HEIGHT / 2.0;
-            let mono = "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
-            let font_full = format!("bold 11px {mono}");
-            let font_small = format!("bold 9px {mono}");
-            let font_ellipsis = format!("bold 6px {mono}");
-
-            ctx.set_fill_style_str("#333333");
-            ctx.set_text_baseline("middle");
-
-            // Try 11px first
-            ctx.set_font(&font_full);
-            let fits_full = ctx.measure_text(&node.name).map(|m| m.width() <= max_w).unwrap_or(false);
-
-            if fits_full {
-                ctx.fill_text(&node.name, node.rect.x + pad, y_mid).ok();
-            } else {
-                let name = strip_extension(&node.name);
-                // Try 9px full
-                ctx.set_font(&font_small);
-                let fits_small = ctx.measure_text(&name).map(|m| m.width() <= max_w).unwrap_or(false);
-
-                if fits_small {
-                    ctx.fill_text(&name, node.rect.x + pad, y_mid).ok();
-                } else {
-                    // Ellipsis + tail at 9px
-                    let ellipsis = "\u{2026}";
-                    ctx.set_font(&font_ellipsis);
-                    let ellipsis_w = ctx.measure_text(ellipsis).map(|m| m.width()).unwrap_or(4.0);
-                    ctx.fill_text(ellipsis, node.rect.x + pad, y_mid).ok();
-
-                    let tail_budget = max_w - ellipsis_w;
-                    if tail_budget > 0.0 {
-                        ctx.set_font(&font_small);
-                        let tail = fit_tail(ctx, &name, tail_budget);
-                        if !tail.is_empty() {
-                            ctx.fill_text(&tail, node.rect.x + pad + ellipsis_w, y_mid).ok();
-                        }
-                    }
-                }
-            }
+            draw_header_label(ctx, &node.name, node.rect.x, node.rect.w, node.rect.y);
         }
 
         for child in &node.children {
@@ -100,9 +62,8 @@ fn render_label(ctx: &CanvasRenderingContext2d, node: &LayoutNode) {
     let max_w = node.rect.w - pad * 2.0;
     let y_mid = node.rect.y + node.rect.h / 2.0;
 
-    let mono = "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
-    let font_main = format!("7px {mono}");
-    let font_ellipsis = format!("5px {mono}");
+    let font_main = format!("7px {MONO_FONT_STACK}");
+    let font_ellipsis = format!("5px {MONO_FONT_STACK}");
 
     ctx.set_fill_style_str("#333333");
     ctx.set_font(&font_main);
@@ -173,25 +134,12 @@ pub fn render_diff(
 ) {
     ctx.set_fill_style_str("#ffffff");
     ctx.fill_rect(root.rect.x, root.rect.y, root.rect.w, root.rect.h);
-    render_diff_node(ctx, root, deltas, &mut String::new());
+    render_diff_node(ctx, root, deltas);
 }
 
-fn render_diff_node(
-    ctx: &CanvasRenderingContext2d,
-    node: &LayoutNode,
-    deltas: &HashMap<String, Delta>,
-    path: &mut String,
-) {
+fn render_diff_node(ctx: &CanvasRenderingContext2d, node: &LayoutNode, deltas: &HashMap<String, Delta>) {
     if node.rect.w < 1.0 || node.rect.h < 1.0 {
         return;
-    }
-
-    let old_len = path.len();
-    if !node.name.is_empty() {
-        if !path.is_empty() {
-            path.push('/');
-        }
-        path.push_str(&node.name);
     }
 
     if node.is_leaf {
@@ -216,26 +164,11 @@ fn render_diff_node(
             ctx.set_fill_style_str("rgb(220,220,220)");
             ctx.fill_rect(node.rect.x, node.rect.y, node.rect.w, HEADER_HEIGHT);
 
-            let pad = 4.0;
-            let max_w = node.rect.w - pad * 2.0;
-            let y_mid = node.rect.y + HEADER_HEIGHT / 2.0;
-            let mono = "\"SF Mono\", \"Cascadia Code\", \"Fira Code\", Consolas, Menlo, monospace";
-            let font = format!("bold 9px {mono}");
-
-            ctx.set_fill_style_str("#333333");
-            ctx.set_text_baseline("middle");
-            ctx.set_font(&font);
-
-            let name = strip_extension(&node.name);
-            if let Ok(m) = ctx.measure_text(&name) {
-                if m.width() <= max_w {
-                    ctx.fill_text(&name, node.rect.x + pad, y_mid).ok();
-                }
-            }
+            draw_header_label(ctx, &node.name, node.rect.x, node.rect.w, node.rect.y);
         }
 
         for child in &node.children {
-            render_diff_node(ctx, child, deltas, path);
+            render_diff_node(ctx, child, deltas);
         }
 
         if node.depth > 0 {
@@ -244,8 +177,6 @@ fn render_diff_node(
             ctx.stroke_rect(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
         }
     }
-
-    path.truncate(old_len);
 }
 
 /// Draw a highlight rectangle around a node matched by path.
@@ -280,6 +211,52 @@ fn round_rect(ctx: &CanvasRenderingContext2d, x: f64, y: f64, w: f64, h: f64, r:
     ctx.line_to(x, y + r);
     ctx.arc_to(x, y, x + r, y, r).ok();
     ctx.close_path();
+}
+
+/// Draw a directory/file header label within `[x, x+w]`, falling back through a full
+/// name, an extension-stripped name at a smaller size, then an ellipsis + best-fit
+/// tail. Shared by the single-file view and comparison-mode panels so a header never
+/// silently renders blank just because its panel is narrower, and so the header text
+/// matches the node's real name (as shown in tooltips) whenever it fits.
+fn draw_header_label(ctx: &CanvasRenderingContext2d, name: &str, x: f64, w: f64, y: f64) {
+    let pad = 4.0;
+    let max_w = w - pad * 2.0;
+    let y_mid = y + HEADER_HEIGHT / 2.0;
+    let font_full = format!("bold 11px {MONO_FONT_STACK}");
+    let font_small = format!("bold 9px {MONO_FONT_STACK}");
+    let font_ellipsis = format!("bold 6px {MONO_FONT_STACK}");
+
+    ctx.set_fill_style_str("#333333");
+    ctx.set_text_baseline("middle");
+
+    ctx.set_font(&font_full);
+    let fits_full = ctx.measure_text(name).map(|m| m.width() <= max_w).unwrap_or(false);
+    if fits_full {
+        ctx.fill_text(name, x + pad, y_mid).ok();
+        return;
+    }
+
+    let stripped = strip_extension(name);
+    ctx.set_font(&font_small);
+    let fits_small = ctx.measure_text(&stripped).map(|m| m.width() <= max_w).unwrap_or(false);
+    if fits_small {
+        ctx.fill_text(&stripped, x + pad, y_mid).ok();
+        return;
+    }
+
+    let ellipsis = "\u{2026}";
+    ctx.set_font(&font_ellipsis);
+    let ellipsis_w = ctx.measure_text(ellipsis).map(|m| m.width()).unwrap_or(4.0);
+    ctx.fill_text(ellipsis, x + pad, y_mid).ok();
+
+    let tail_budget = max_w - ellipsis_w;
+    if tail_budget > 0.0 {
+        ctx.set_font(&font_small);
+        let tail = fit_tail(ctx, &stripped, tail_budget);
+        if !tail.is_empty() {
+            ctx.fill_text(&tail, x + pad + ellipsis_w, y_mid).ok();
+        }
+    }
 }
 
 /// Strip file extension (e.g. ".c", ".h", ".rs") if present.
