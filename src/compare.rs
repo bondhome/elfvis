@@ -10,21 +10,27 @@
 //!    is therefore derived from the raw DWARF paths, normalized against each
 //!    other: first the two build roots are aligned (they may differ, e.g. two
 //!    checkouts), then one shared prefix is trimmed from both.
-//! 2. **Joint key assignment.** `(source, name)` identifies a symbol unless it
-//!    collides (same-named locals in different object files, even attributed to
-//!    one shared header). Wherever it collides in *either* file, both files
-//!    refine that key with the translation unit from the ELF's `STT_FILE`
-//!    provenance, so the refinement is applied consistently to the pair.
-//! 3. **Explicit ambiguity.** If a key still collides after refinement, unique
-//!    matching cannot be established. Those keys are reported in
-//!    [`Comparison::ambiguous`] (with combined sizes) instead of one duplicate
-//!    silently overwriting another in a map.
+//! 2. **Identity includes translation unit for locals.** A local symbol's name
+//!    is only unique within its object file, and the source it is attributed to
+//!    can be shared (a `static` in a header included by several `.c` files), so
+//!    `(source, name, translation unit)` is the identity — always, not only when
+//!    a duplicate happens to be present on one side: with one copy per ELF, a
+//!    `helper` from `a.c` and a `helper` from `b.c` are still different symbols.
+//!    The translation unit comes from the ELF's `STT_FILE` provenance (reduced
+//!    to its basename, so it does not depend on how the compiler was invoked).
+//! 3. **Explicit ambiguity.** If an identity still collides (no provenance, or
+//!    equal `STT_FILE` names), unique matching cannot be established. Those keys
+//!    are reported in [`Comparison::ambiguous`] (with combined sizes) instead of
+//!    one duplicate silently overwriting another in a map.
+//! 4. **Joint clustering.** Which unresolved-symbol name prefixes form named
+//!    clusters (versus the `<other>` catch-all) is decided once for the pair, so
+//!    a group means the same thing in both trees.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::diff::{compute_diff, Delta};
 use crate::parse::{common_dir_prefix_len, ResolvedSymbol, SymbolDetail};
-use crate::tree::{build_tree_with_keys, SizeNode, SymbolKey};
+use crate::tree::{build_tree_clustered, unresolved_cluster_prefixes, SizeNode, SymbolKey};
 
 pub struct Comparison {
     pub tree_a: SizeNode,
@@ -46,19 +52,28 @@ fn components(path: &str) -> Vec<&str> {
     path.split('/').filter(|c| !c.is_empty()).collect()
 }
 
+/// Number of leading path components shared by *every* file in `files` — the
+/// deepest directory all of a side's sources live under.
+fn shared_depth(files: &BTreeSet<&str>) -> usize {
+    let len = common_dir_prefix_len(files.iter().copied());
+    files.iter().next().map_or(0, |f| components(&f[..len]).len())
+}
+
 /// How many leading path components to drop from each side so that the same
 /// source file gets the same path in both ELFs.
 ///
 /// The two builds may live under different roots (`/home/a/proj/src/x.c` vs
 /// `/ci/ws/src/x.c`), so this picks the pair of strip counts that makes the
-/// most source files coincide; ties prefer stripping less, which keeps as much
-/// real path information as possible. It looks only at the files, never at
-/// which symbols they contain, so it does not shift when a file is added.
+/// most source files coincide; ties prefer stripping less. It only ever removes
+/// a side's *shared* leading directories (never more than [`shared_depth`]):
+/// components that distinguish one of its files from another (`old/` vs `src/`)
+/// are real project structure, and stripping them just to make basenames line up
+/// would invent matches between different files. It looks only at the files,
+/// never at which symbols they contain, so it does not shift when a file is added.
 fn align_roots(a: &BTreeSet<&str>, b: &BTreeSet<&str>) -> (usize, usize) {
     let stripped = |files: &BTreeSet<&str>| -> Vec<HashSet<String>> {
         let comps: Vec<Vec<&str>> = files.iter().map(|f| components(f)).collect();
-        let max_strip = comps.iter().map(|c| c.len()).max().unwrap_or(1);
-        (0..max_strip)
+        (0..=shared_depth(files))
             .map(|n| comps.iter().filter(|c| c.len() > n).map(|c| c[n..].join("/")).collect())
             .collect()
     };
@@ -110,18 +125,8 @@ fn normalize_sources(a: &[SymbolDetail], b: &[SymbolDetail]) -> (Vec<Option<Stri
 pub fn compare(a: &[SymbolDetail], b: &[SymbolDetail]) -> Comparison {
     let (sources_a, sources_b) = normalize_sources(a, b);
 
-    let mut collided: HashSet<(Option<String>, String)> = HashSet::new();
-    for (syms, sources) in [(a, &sources_a), (b, &sources_b)] {
-        let mut seen: HashSet<(&Option<String>, &str)> = HashSet::new();
-        for (sym, source) in syms.iter().zip(sources) {
-            if !seen.insert((source, sym.name.as_str())) {
-                collided.insert((source.clone(), sym.name.clone()));
-            }
-        }
-    }
-
-    let side_a = build_side(a, sources_a, &collided);
-    let side_b = build_side(b, sources_b, &collided);
+    let side_a = build_side(a, sources_a);
+    let side_b = build_side(b, sources_b);
 
     let ambiguous: HashSet<SymbolKey> = side_a
         .counts
@@ -131,19 +136,25 @@ pub fn compare(a: &[SymbolDetail], b: &[SymbolDetail]) -> Comparison {
         .map(|(k, _)| k.clone())
         .collect();
 
+    let mut clustered = unresolved_cluster_prefixes(&side_a.symbols);
+    clustered.extend(unresolved_cluster_prefixes(&side_b.symbols));
+
     Comparison {
         deltas: compute_diff(&side_a.sizes, &side_b.sizes),
-        tree_a: build_tree_with_keys(&side_a.symbols, &side_a.keys),
-        tree_b: build_tree_with_keys(&side_b.symbols, &side_b.keys),
+        tree_a: build_tree_clustered(&side_a.symbols, &side_a.keys, &clustered),
+        tree_b: build_tree_clustered(&side_b.symbols, &side_b.keys, &clustered),
         ambiguous,
     }
 }
 
-fn build_side(
-    details: &[SymbolDetail],
-    sources: Vec<Option<String>>,
-    collided: &HashSet<(Option<String>, String)>,
-) -> Side {
+/// Translation-unit part of a local symbol's identity: the `STT_FILE` name's
+/// basename, so `sub/a.c` and `./a.c` (same object compiled with different
+/// invocations) agree.
+fn tu_identity(tu: Option<&str>) -> Option<String> {
+    tu.map(|t| t.rsplit('/').next().unwrap_or(t).to_string())
+}
+
+fn build_side(details: &[SymbolDetail], sources: Vec<Option<String>>) -> Side {
     let mut side = Side {
         symbols: Vec::with_capacity(details.len()),
         keys: Vec::with_capacity(details.len()),
@@ -151,8 +162,7 @@ fn build_side(
         counts: HashMap::new(),
     };
     for (d, source) in details.iter().zip(sources) {
-        let tu = if collided.contains(&(source.clone(), d.name.clone())) { d.tu.clone() } else { None };
-        let key = SymbolKey { source: source.clone(), name: d.name.clone(), tu };
+        let key = SymbolKey { source: source.clone(), name: d.name.clone(), tu: tu_identity(d.tu.as_deref()) };
         *side.sizes.entry(key.clone()).or_insert(0) += d.size;
         *side.counts.entry(key.clone()).or_insert(0) += 1;
         side.symbols.push(ResolvedSymbol { name: d.name.clone(), size: d.size, source_path: source });
@@ -317,5 +327,49 @@ mod tests {
             let group = find(tree, "src").and_then(|n| n.group.clone()).expect("src dir");
             assert_eq!(crate::diff::aggregate_group(&cmp.deltas, &group), (230, 150));
         }
+    }
+
+    #[test]
+    fn test_other_catch_all_means_the_same_in_both_trees() {
+        // `<other>` used to carry a prefix list taken from each tree's own
+        // singletons ([spare] vs [added, spare]), so hovering it gave 10->10 on
+        // one side and 10->30 on the other. Which prefixes are named clusters is
+        // now decided jointly, and `<other>` is "unresolved and not clustered".
+        let a = [sym("motor_init", 100, None, None), sym("motor_step", 50, None, None), sym("spare_one", 10, None, None)];
+        let b = [
+            sym("motor_init", 100, None, None),
+            sym("motor_step", 50, None, None),
+            sym("spare_one", 10, None, None),
+            sym("added_one", 20, None, None),
+        ];
+        let cmp = compare(&a, &b);
+        for tree in [&cmp.tree_a, &cmp.tree_b] {
+            let group = find(tree, "<other>").and_then(|n| n.group.clone()).expect("<other>");
+            assert_eq!(crate::diff::aggregate_group(&cmp.deltas, &group), (10, 30));
+        }
+    }
+
+    #[test]
+    fn test_prefix_that_becomes_a_cluster_on_one_side_is_a_cluster_on_both() {
+        // `added_*` is a singleton in the old file but a pair in the new one.
+        // It must be a named cluster in both trees (not <other> in one).
+        let a = [sym("added_one", 20, None, None), sym("spare_x", 10, None, None)];
+        let b = [sym("added_one", 20, None, None), sym("added_two", 30, None, None), sym("spare_x", 10, None, None)];
+        let cmp = compare(&a, &b);
+        for tree in [&cmp.tree_a, &cmp.tree_b] {
+            let group = find(tree, "added").and_then(|n| n.group.clone()).expect("added cluster in both trees");
+            assert_eq!(crate::diff::aggregate_group(&cmp.deltas, &group), (20, 50));
+        }
+    }
+
+    #[test]
+    fn test_alignment_never_strips_directories_that_distinguish_files() {
+        // Shared root /w; old/b.c vs new/b.c are different files even though
+        // the basenames agree. Only /w/src/a.c is a real anchor.
+        let a = [sym("use_a", 22, Some("/w/src/a.c"), None), sym("helper", 22, Some("/w/old/b.c"), Some("b.c"))];
+        let b = [sym("use_a", 22, Some("/w/src/a.c"), None), sym("helper", 50, Some("/w/new/b.c"), Some("b.c"))];
+        let cmp = compare(&a, &b);
+        let helpers: Vec<_> = cmp.deltas.iter().filter(|(k, _)| k.name == "helper").collect();
+        assert_eq!(helpers.len(), 2, "{helpers:?}");
     }
 }

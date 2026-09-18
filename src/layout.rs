@@ -215,23 +215,27 @@ fn worst_aspect(row: &[f64], side: f64, total: f64, area: f64) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
-/// Find the deepest (most specific) node at the given point.
-pub fn hit_test(node: &LayoutNode, x: f64, y: f64) -> Option<Vec<String>> {
+/// The chain of nodes from `node` down to the deepest (most specific) node at
+/// the given point, root first.
+///
+/// Returns the nodes themselves rather than their names: siblings can share a
+/// name (two same-named local symbols under one header), so re-finding a node
+/// from a name path would silently pick the first match.
+pub fn hit_test(node: &LayoutNode, x: f64, y: f64) -> Option<Vec<&LayoutNode>> {
     if x < node.rect.x || x > node.rect.x + node.rect.w
         || y < node.rect.y || y > node.rect.y + node.rect.h
     {
         return None;
     }
 
+    let mut chain = vec![node];
     for child in &node.children {
-        if let Some(path) = hit_test(child, x, y) {
-            let mut result = vec![node.name.clone()];
-            result.extend(path);
-            return Some(result);
+        if let Some(rest) = hit_test(child, x, y) {
+            chain.extend(rest);
+            return Some(chain);
         }
     }
-
-    Some(vec![node.name.clone()])
+    Some(chain)
 }
 
 #[cfg(test)]
@@ -332,5 +336,23 @@ mod tests {
         let root = layout(&tree, 800.0, 600.0);
         assert_eq!(root.rect.w, 800.0);
         assert!(root.children.is_empty());
+    }
+
+    #[test]
+    fn test_hit_test_returns_the_hit_node_among_same_named_siblings() {
+        let tree = SizeNode {
+            name: "root".into(),
+            size: 100,
+            children: vec![
+                SizeNode { name: "helper".into(), size: 50, ..Default::default() },
+                SizeNode { name: "helper".into(), size: 50, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let root = layout(&tree, 200.0, 100.0);
+        let second = &root.children[1];
+        let chain = hit_test(&root, second.rect.x + second.rect.w / 2.0, second.rect.y + second.rect.h / 2.0).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert!(std::ptr::eq(chain[1], second), "must be the second `helper`, not the first with the same name");
     }
 }

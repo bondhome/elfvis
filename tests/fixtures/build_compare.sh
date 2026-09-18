@@ -16,3 +16,14 @@ CC="arm-none-eabi-gcc -O0 -g -mcpu=cortex-m4 -mthumb -nostartfiles -ffunction-se
 # src/ gains a whole new file (src/c.c) in the second ELF.
 (cd group_before && $CC m.c src/a.c src/b.c -o ../../../group_before.elf)
 (cd group_after  && $CC m.c src/a.c src/b.c src/c.c -o ../../../group_after.elf)
+
+# Same relative dirs, but old/b.c is replaced by a *different* new/b.c (each
+# with its own local helper): a shared src/a.c anchor exists, and b.c must not
+# be treated as "the same file" just because the basenames match.
+(cd dir_move_before && $CC src/a.c old/b.c -o ../../../dir_move_before.elf 2>/dev/null)
+(cd dir_move_after  && $CC src/a.c new/b.c -o ../../../dir_move_after.elf 2>/dev/null)
+
+# Exactly one static helper() per ELF, from different translation units
+# (a.c vs b.c) that include the same shared.h: cardinality is 1 on each side.
+(cd tu_before && $CC a.c -o ../../../tu_before.elf 2>/dev/null)
+(cd tu_after  && $CC b.c -o ../../../tu_after.elf 2>/dev/null)

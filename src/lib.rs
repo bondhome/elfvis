@@ -483,18 +483,11 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
             ctx_b.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0).ok();
             render::render_diff(&ctx_b, state.compare_layout.as_ref().unwrap(), deltas, &state.ambiguous);
 
-            if let Some(path) = layout::hit_test(hovered, x, y) {
-                // Walk to hovered node (within the hovered tree's own display
-                // path — safe here, unlike cross-tree matching, since we're
-                // walking the same tree hit_test just matched against).
-                let mut node = hovered;
-                for name in &path[1..] {
-                    if let Some(child) = node.children.iter().find(|c| c.name == *name) {
-                        node = child;
-                    } else {
-                        break;
-                    }
-                }
+            if let Some(chain) = layout::hit_test(hovered, x, y) {
+                // The node under the cursor, as returned by the hit test. It
+                // must not be re-found by name: same-named sibling leaves are
+                // legitimate (two locals named `helper` under one header).
+                let node = *chain.last().unwrap();
 
                 // What the hovered box stands for: one exact symbol for a leaf,
                 // a logical group (directory / unresolved cluster) otherwise.
@@ -510,7 +503,7 @@ fn handle_compare_hover(x: f64, y: f64, is_canvas_b: bool) {
                     render::render_highlight(other_ctx, other, &|k| group.contains(k));
                 }
 
-                let display_name = path.last().map(|s| s.as_str()).unwrap_or("");
+                let display_name = node.name.as_str();
                 let tooltip = if node.is_leaf {
                     if let Some(delta) = node.key.as_ref().and_then(|k| deltas.get(k)) {
                         let before_str = delta.before.map(format_size).unwrap_or_else(|| "\u{2014}".into());
@@ -582,15 +575,8 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
                 ctx.set_transform(state.dpr, 0.0, 0.0, state.dpr, 0.0, 0.0).ok();
                 render::render(&ctx, root);
 
-                if let Some(path) = layout::hit_test(root, x, y) {
-                    let mut node = root;
-                    for name in &path[1..] {
-                        if let Some(child) = node.children.iter().find(|c| c.name == *name) {
-                            node = child;
-                        } else {
-                            break;
-                        }
-                    }
+                if let Some(chain) = layout::hit_test(root, x, y) {
+                    let node = *chain.last().unwrap();
 
                     let pct = if state.total_size > 0 {
                         node.size as f64 / state.total_size as f64 * 100.0
@@ -601,12 +587,12 @@ fn setup_canvas_events(document: &Document) -> Result<(), JsValue> {
 
                     // Show "filename\nsymbol  size (pct%)"
                     // The path is [root, ..dirs.., file, symbol] for leaves
-                    let parts = &path[1..];
+                    let parts: Vec<&str> = chain[1..].iter().map(|n| n.name.as_str()).collect();
                     let tooltip = if parts.len() >= 2 {
-                        let file_node = &parts[parts.len() - 2];
+                        let file_node = parts[parts.len() - 2];
                         // basename: last component after any '/' from collapsed paths
                         let basename = file_node.rsplit('/').next().unwrap_or(file_node);
-                        let sym_name = &parts[parts.len() - 1];
+                        let sym_name = parts[parts.len() - 1];
                         format!("{basename}\n{sym_name}\n{size_str} ({pct:.1}%)")
                     } else {
                         let display_path = parts.join("/");

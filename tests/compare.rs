@@ -6,6 +6,7 @@
 use elfvis::compare::{compare, Comparison};
 use elfvis::diff::aggregate_group;
 use elfvis::parse::{parse_elf_detailed, SymbolDetail};
+use elfvis::layout::{hit_test, layout, LayoutNode};
 use elfvis::tree::{Group, SizeNode};
 
 fn load(bytes: &[u8]) -> Vec<SymbolDetail> {
@@ -119,4 +120,74 @@ fn files_at_the_build_root_and_in_subdirectories_align_together() {
     assert_eq!(start[0].diff_bytes(), 0);
     assert!(cmp.deltas.values().filter(|d| d.before.is_none()).count() == 1, "only `added` is new");
     assert!(cmp.deltas.values().all(|d| d.after.is_some()), "nothing was removed");
+}
+
+#[test]
+fn hovering_a_same_named_sibling_selects_that_symbol_not_the_first() {
+    // Both `helper`s sit under shared.h. Hit-test the centre of the unchanged
+    // b.c copy in the new tree; the node under the cursor (and therefore the
+    // tooltip delta and the cross-highlight) must be b.c's, not a.c's.
+    let a = load(include_bytes!("fixtures/shared_header_before.elf"));
+    let b = load(include_bytes!("fixtures/shared_header_after.elf"));
+    let cmp = compare(&a, &b);
+    let root = layout(&cmp.tree_b, 800.0, 600.0);
+
+    fn helpers<'a>(n: &'a LayoutNode, out: &mut Vec<&'a LayoutNode>) {
+        if n.is_leaf && n.name == "helper" {
+            out.push(n);
+        }
+        for c in &n.children {
+            helpers(c, out);
+        }
+    }
+    let mut hs = Vec::new();
+    helpers(&root, &mut hs);
+    assert_eq!(hs.len(), 2);
+    let from_b = hs.iter().find(|n| n.key.as_ref().unwrap().tu.as_deref() == Some("b.c")).unwrap();
+
+    let chain = hit_test(&root, from_b.rect.x + from_b.rect.w / 2.0, from_b.rect.y + from_b.rect.h / 2.0).unwrap();
+    let hit = chain.last().unwrap();
+    assert!(std::ptr::eq(*hit, *from_b), "hit node must be b.c's helper");
+
+    let delta = &cmp.deltas[hit.key.as_ref().unwrap()];
+    assert_eq!(delta.diff_bytes(), 0, "b.c's helper is unchanged; a.c's +N must not leak in");
+}
+
+#[test]
+fn different_files_with_the_same_basename_are_not_merged_by_root_alignment() {
+    // Before: src/a.c + old/b.c. After: the same src/a.c + a different new/b.c,
+    // each with its own local `helper`. src/a.c is an exact anchor at the shared
+    // root, so the alignment must not strip `old/`/`new/` just to make the two
+    // b.c basenames coincide.
+    let a = load(include_bytes!("fixtures/dir_move_before.elf"));
+    let b = load(include_bytes!("fixtures/dir_move_after.elf"));
+    let cmp = compare(&a, &b);
+
+    let helpers = delta_named(&cmp, "helper");
+    assert_eq!(helpers.len(), 2, "old/b.c and new/b.c helpers are separate identities: {helpers:?}");
+    assert!(
+        helpers.iter().all(|d| d.before.is_none() || d.after.is_none()),
+        "one removed, one added — not a single 22 -> N change: {helpers:?}"
+    );
+    let use_a = delta_named(&cmp, "use_a");
+    assert_eq!(use_a.len(), 1);
+    assert_eq!((use_a[0].before, use_a[0].after), (Some(22), Some(22)), "the anchor file still matches");
+}
+
+#[test]
+fn local_translation_unit_identity_is_kept_when_each_side_has_one_copy() {
+    // Exactly one static helper() per ELF, but from different translation units
+    // (a.c vs b.c) that include the same header, so the raw source is identical.
+    let a = load(include_bytes!("fixtures/tu_before.elf"));
+    let b = load(include_bytes!("fixtures/tu_after.elf"));
+    let ha = a.iter().find(|s| s.name == "helper").unwrap();
+    let hb = b.iter().find(|s| s.name == "helper").unwrap();
+    assert_eq!(ha.raw_path.as_deref().map(|p| p.rsplit('/').next()), hb.raw_path.as_deref().map(|p| p.rsplit('/').next()));
+    assert_ne!(ha.tu, hb.tu, "precondition: provenance differs");
+
+    let cmp = compare(&a, &b);
+    let helpers = delta_named(&cmp, "helper");
+    assert_eq!(helpers.len(), 2, "two different local definitions: {helpers:?}");
+    assert!(helpers.iter().all(|d| d.before.is_none() || d.after.is_none()));
+    assert!(cmp.ambiguous.is_empty(), "provenance is sufficient here; nothing is ambiguous");
 }

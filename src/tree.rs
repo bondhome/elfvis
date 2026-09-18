@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Stable identity for a symbol (leaf), independent of the display tree's
 /// clustering/collapsing.
 ///
 /// `source` is `None` when DWARF could not place the symbol. `tu` is the
-/// translation unit (from the ELF's `STT_FILE` provenance) and is only filled
-/// in when `(source, name)` alone is not unique — see `compare::compare`. Two
-/// object files may legitimately define same-named locals, even attributed to
-/// the same header, so neither name nor source file is a translation-unit
-/// identity on its own.
+/// translation unit of a local symbol (from the ELF's `STT_FILE` provenance),
+/// `None` for globals and when the ELF carries no provenance. Two object files
+/// may legitimately define same-named locals, even attributed to the same
+/// header, so neither name nor source file is a translation-unit identity on
+/// its own — see `compare::compare`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SymbolKey {
     pub source: Option<String>,
@@ -27,15 +28,23 @@ pub fn symbol_key(sym: &crate::parse::ResolvedSymbol) -> SymbolKey {
 /// built from different symbol sets, so a group's membership must be evaluated
 /// over both inputs (e.g. a file added only in the new ELF still belongs to
 /// its directory when the old ELF's directory node is hovered).
+///
+/// Every variant must mean the same thing in both trees of a comparison, so
+/// none of them may embed a list derived from one tree's own contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Group {
     /// The whole tree.
     All,
     /// Symbols whose source path lies under this directory (path components).
     Dir(Vec<String>),
-    /// Symbols DWARF could not place. `None` = all of them; `Some(prefixes)` =
-    /// only those whose name-cluster prefix (see `extract_prefix`) is listed.
-    Unresolved(Option<Vec<String>>),
+    /// Every symbol DWARF could not place.
+    Unresolved,
+    /// Unresolved symbols sharing this name-cluster prefix (see `extract_prefix`).
+    UnresolvedCluster(String),
+    /// Unresolved symbols whose prefix is *not* a named cluster — the
+    /// `<other>` catch-all. The set of named clusters is fixed for the whole
+    /// tree (or, in comparison mode, jointly for both trees).
+    UnresolvedOther(Rc<HashSet<String>>),
 }
 
 impl Group {
@@ -46,12 +55,26 @@ impl Group {
                 let mut comps = s.split('/').filter(|c| !c.is_empty());
                 dir.iter().all(|d| comps.next() == Some(d.as_str()))
             }),
-            Group::Unresolved(None) => key.source.is_none(),
-            Group::Unresolved(Some(prefixes)) => {
-                key.source.is_none() && prefixes.contains(&extract_prefix(&key.name))
+            Group::Unresolved => key.source.is_none(),
+            Group::UnresolvedCluster(prefix) => {
+                key.source.is_none() && extract_prefix(&key.name) == *prefix
+            }
+            Group::UnresolvedOther(clustered) => {
+                key.source.is_none() && !clustered.contains(&extract_prefix(&key.name))
             }
         }
     }
+}
+
+/// Name-cluster prefixes that have at least two unresolved symbols in `symbols`
+/// — the rule `build_tree` uses to decide which prefixes get their own cluster
+/// node (everything else goes to `<other>`).
+pub fn unresolved_cluster_prefixes(symbols: &[crate::parse::ResolvedSymbol]) -> HashSet<String> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for s in symbols.iter().filter(|s| s.source_path.is_none()) {
+        *counts.entry(extract_prefix(&s.name)).or_insert(0) += 1;
+    }
+    counts.into_iter().filter(|&(_, n)| n >= 2).map(|(p, _)| p).collect()
 }
 
 /// A node in the size tree.
@@ -112,6 +135,17 @@ pub fn build_tree(symbols: &[crate::parse::ResolvedSymbol]) -> SizeNode {
 /// `keys` (parallel to `symbols`) — comparison mode assigns those jointly over
 /// both inputs so a symbol gets the same key in both trees.
 pub fn build_tree_with_keys(symbols: &[crate::parse::ResolvedSymbol], keys: &[SymbolKey]) -> SizeNode {
+    build_tree_clustered(symbols, keys, &unresolved_cluster_prefixes(symbols))
+}
+
+/// Like [`build_tree_with_keys`], with the set of unresolved-symbol prefixes
+/// that get a named cluster given explicitly. Comparison mode decides that set
+/// once for both trees so `<other>` means the same thing in each.
+pub fn build_tree_clustered(
+    symbols: &[crate::parse::ResolvedSymbol],
+    keys: &[SymbolKey],
+    clustered: &HashSet<String>,
+) -> SizeNode {
     assert_eq!(symbols.len(), keys.len());
     let mut root = SizeNode {
         name: String::new(),
@@ -139,7 +173,7 @@ pub fn build_tree_with_keys(symbols: &[crate::parse::ResolvedSymbol], keys: &[Sy
                 Some(i) => i,
                 None => {
                     let group = if sym.source_path.is_none() {
-                        Group::Unresolved(None)
+                        Group::Unresolved
                     } else {
                         Group::Dir(parts[..=depth].iter().map(|c| c.to_string()).collect())
                     };
@@ -169,7 +203,7 @@ pub fn build_tree_with_keys(symbols: &[crate::parse::ResolvedSymbol], keys: &[Sy
 
     // Cluster unknown symbols by prefix
     if let Some(unknown) = root.children.iter_mut().find(|c| c.name == "<unknown>") {
-        cluster_unknown_children(unknown);
+        cluster_unknown_children(unknown, clustered);
     }
 
     // Compute sizes bottom-up and sort children by size descending
@@ -216,8 +250,9 @@ fn compute_sizes(node: &mut SizeNode) {
 }
 
 /// Regroup flat children of the `<unknown>` node into prefix-based clusters.
-/// Prefixes with fewer than 2 symbols are merged into an `<other>` catch-all.
-fn cluster_unknown_children(node: &mut SizeNode) {
+/// Prefixes in `clustered` get a cluster node; the rest are merged into an
+/// `<other>` catch-all.
+fn cluster_unknown_children(node: &mut SizeNode, clustered: &HashSet<String>) {
     // Bucket children by prefix
     let mut buckets: HashMap<String, Vec<SizeNode>> = HashMap::new();
     for child in node.children.drain(..) {
@@ -225,16 +260,15 @@ fn cluster_unknown_children(node: &mut SizeNode) {
         buckets.entry(prefix).or_default().push(child);
     }
 
-    // Build cluster nodes; singletons go to <other>
     let mut other_children: Vec<SizeNode> = Vec::new();
     for (prefix, children) in buckets {
-        if children.len() >= 2 {
+        if clustered.contains(&prefix) {
             node.children.push(SizeNode {
                 name: prefix.clone(),
                 size: 0,
                 children,
                 key: None,
-                group: Some(Group::Unresolved(Some(vec![prefix]))),
+                group: Some(Group::UnresolvedCluster(prefix)),
             });
         } else {
             other_children.extend(children);
@@ -243,16 +277,12 @@ fn cluster_unknown_children(node: &mut SizeNode) {
 
     // Add <other> if non-empty
     if !other_children.is_empty() {
-        let mut prefixes: Vec<String> =
-            other_children.iter().map(|c| extract_prefix(&c.name)).collect();
-        prefixes.sort();
-        prefixes.dedup();
         node.children.push(SizeNode {
             name: "<other>".to_string(),
             size: 0,
             children: other_children,
             key: None,
-            group: Some(Group::Unresolved(Some(prefixes))),
+            group: Some(Group::UnresolvedOther(Rc::new(clustered.clone()))),
         });
     }
 }
