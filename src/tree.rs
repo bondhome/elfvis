@@ -96,7 +96,8 @@ fn compute_sizes(node: &mut SizeNode) {
         compute_sizes(child);
     }
     node.size = node.children.iter().map(|c| c.size).sum();
-    node.children.sort_by(|a, b| b.size.cmp(&a.size));
+    node.children
+        .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
 }
 
 /// Regroup flat children of the `<unknown>` node into prefix-based clusters.
